@@ -1,0 +1,2359 @@
+// =====================================================
+//  MENTPREV - sistem de mentenanta predictiva pe ESP32-S3
+//  Monitorizeaza starea unui utilaj prin analiza acustica (microfon I2S)
+//  si de vibratie (accelerometru MMA8452Q), calculeaza un scor de
+//  sanatate (HealthScore) si logheaza datele pe card SD.
+//  Interfata: ecran rotund TFT 240x240 + doua butoane + interfata web (AP WiFi).
+// =====================================================
+
+// ---- Biblioteci externe ----
+#include <TFT_eSPI.h>                // driver ecran TFT (display rotund 240x240)
+#include <Wire.h>                    // magistrala I2C (accelerometru + RTC)
+#include <SparkFun_MMA8452Q.h>       // driver accelerometru MMA8452Q
+#include <driver/i2s.h>              // interfata I2S pentru microfonul digital
+#include "arduinoFFT.h"             // transformata Fourier rapida (FFT)
+#include <math.h>                    // functii matematice (sqrtf, fabs, cos, sin)
+#include <SPI.h>                     // magistrala SPI (cardul SD)
+#include <SD.h>                      // sistem de fisiere pe card SD
+#include <WiFi.h>                    // stiva WiFi (mod Access Point)
+
+// ===== WiFi AP + Web Server =====
+#include <WebServer.h>               // server HTTP pentru interfata web
+
+// =====================================================
+// PCF8563 RTC - REGISTRI SI ADRESA I2C
+// Ceasul de timp real pastreaza data/ora chiar si dupa oprire.
+// Valorile de mai jos sunt adresele registrelor interne ale cipului.
+// =====================================================
+#define PCF8563_ADDR        0x51     // adresa I2C a ceasului RTC
+#define PCF8563_REG_STATUS1 0x00     // registru de control/stare 1
+#define PCF8563_REG_VL_SEC  0x02     // secunde (+ bit de "tensiune scazuta")
+#define PCF8563_REG_MINUTES 0x03     // minute
+#define PCF8563_REG_HOURS   0x04     // ore
+#define PCF8563_REG_DAY     0x05     // ziua din luna
+#define PCF8563_REG_WEEKDAY 0x06     // ziua din saptamana
+#define PCF8563_REG_MONTH   0x07     // luna
+#define PCF8563_REG_YEAR    0x08     // anul (doua cifre)
+
+// =====================================================
+// STRUCTURA ACCEL
+// Grupeaza cele trei axe ale acceleratiei intr-un singur obiect,
+// pentru a fi pasat usor intre functii si task-uri.
+// =====================================================
+struct AccelData {
+  struct { float x, y, z; } acceleration;  // acceleratie pe X, Y, Z (in m/s^2)
+};
+
+// =====================================================
+// CONFIGURARE HARDWARE - maparea pinilor fizici
+// =====================================================
+#define PWR_HOLD_PIN     2           // tine alimentarea pornita (latch); LOW = oprire completa
+#define DISPLAY_PWR_PIN  4           // backlight ecran: LOW = aprins, HIGH = stins
+#define PWR_BTN_PIN     18           // buton PWR (alimentare / inapoi / schimba valoare)
+#define NAV_BTN_PIN     21           // buton NAV (navigare / confirmare)
+
+// LED status WiFi
+#define WIFI_LED_PIN    38           // LED care indica starea AP-ului WiFi
+
+// LED status masina (clipeste in functie de health, doar in monitoring)
+#define STATUS_LED_PIN  48           // LED de stare a utilajului (ritm de clipire)
+
+// I2S Mic - microfonul digital (semnalul acustic)
+#define I2S_WS      16               // word select (LRCLK)
+#define I2S_SD      17               // data in (semnalul de la microfon)
+#define I2S_SCK     15               // bit clock (BCLK)
+
+// I2C - magistrala partajata de accelerometru si RTC
+#define I2C_SDA     8                // linia de date I2C
+#define I2C_SCL     9                // linia de ceas I2C
+
+// SD pe VSPI - cardul de memorie pe magistrala SPI dedicata
+#define SD_MOSI     6                // master out, slave in
+#define SD_MISO     7                // master in, slave out
+#define SD_SCK      5                // ceasul SPI
+#define SD_CS_PIN   47               // chip select pentru card
+
+#define SAMPLES         256          // esantioane per fereastra FFT (microfon)
+#define FFT_BINS        64           // bin-uri spectrale pastrate (din SAMPLES/2)
+#define SAMPLING_FREQ   10000        // frecventa de esantionare a microfonului (Hz)
+
+// ===== FFT ACCELEROMETRU (analiza de vibratie) =====
+#define ACC_SAMPLES     256          // marime fereastra FFT pe accel
+#define ACC_FFT_BINS    64           // cate bin-uri pastram/logam
+#define ACC_SAMPLE_HZ   250          // rata de esantionare a accelerometrului (Hz)
+// Nyquist = 125 Hz -> acopera defecte mecanice tipice (dezechilibru, aliniere, rulmenti)
+// Rezolutie: 250/256 ~= 0.98 Hz per bin
+// 250 Hz e fiabil pe I2C impreuna cu restul sistemului (500 Hz suprasolicita magistrala)
+
+// =====================================================
+// CONSTANTE DE TUNING
+// Valori determinate empiric, prin testare iterativa pe utilaj real.
+// Alese astfel incat o masina sanatoasa sa fie evaluata constant aproape
+// de 100%, iar abaterile semnificative sa fie detectate fara fals-pozitive.
+// =====================================================
+const float FFT_SMOOTH_ALPHA            = 0.12f;   // netezire spectru microfon (mai mare = mai reactiv)
+const float HEALTH_SMOOTH_ALPHA         = 0.05f;   // netezire health (mic = stabil, sanatatea nu sare brusc)
+const float VIB_SMOOTH_ALPHA            = 0.12f;   // netezire nivel vibratie
+const float AMBIENT_MULTIPLIER          = 1.35f;   // marja peste zgomotul ambiant (reduce fals-pozitivele)
+const float FFT_NOISE_GATE              = 120.0f;  // prag sub care energia spectrala e tratata ca zgomot
+const float MACHINE_OFF_POWER_RATIO     = 0.22f;   // sub acest raport din puterea invatata -> masina oprita
+const float MACHINE_OFF_VIB_THRESHOLD   = 0.55f;   // sub acest nivel de vibratie -> masina oprita
+const float VIBRATION_WEIGHT            = 2600.0f; // cat de mult conteaza vibratia in scaderea health-ului
+const float HEALTH_DIFF_SCALE           = 1800.0f; // normalizeaza diferenta totala pe scala 0-100
+const float ANOMALY_ATTACK              = 5.0f;    // cresterea anomaliei cand health-ul instant e scazut
+const float ANOMALY_RELEASE             = 1.5f;    // scaderea anomaliei cand lucrurile revin la normal
+const float ANOMALY_THRESHOLD           = 18.0f;   // peste acest nivel de anomalie incepe penalizarea
+const float ANOMALY_MAX                 = 100.0f;  // plafon pentru scorul de anomalie
+const int   SERIAL_INTERVAL_NORMAL_MS   = 3000;    // perioada de logare in regim normal (ms)
+const int   SERIAL_INTERVAL_ALERT_MS    = 500;     // perioada de logare in regim de alerta (ms)
+const int   HEALTH_ALERT_THRESHOLD      = 80;      // sub acest health se trece la logare deasa
+const unsigned long DEBOUNCE_MS         = 40;      // timp anti-debounce pentru butoane (ms)
+const unsigned long NAV_LONG_MS         = 600;     // pragul pentru apasare "lunga" pe NAV (ms)
+const unsigned long PWR_LONG_BACK_MS    = 600;     // pragul pentru apasare "lunga" pe PWR (ms)
+
+const float G_TO_MS2 = 9.81f;        // conversie din g in m/s^2
+const float ROTATION_SPEED = 6.0f;   // viteza animatiei meniului (grade per cadru)
+
+#define SCREEN_CX   120              // centrul ecranului pe X (240/2)
+#define SCREEN_CY   120              // centrul ecranului pe Y
+#define SCREEN_R    118              // raza ecranului rotund
+#define PLOT_R      105              // raza zonei de desenare a graficului
+
+const uint16_t BG_COLOR = TFT_BLACK; // culoarea de fundal a interfetei
+
+// =====================================================
+// TIPURI / STARI
+// =====================================================
+enum MountMode   { TOP, FRONT, SIDE };  // orientarea de montaj detectata din directia gravitatiei
+// Masina de stari a interfetei: ce ecran e activ in acest moment
+enum SystemState { MAIN_MENU, FILE_BROWSER, SETTINGS_VIEW, SETTINGS_SET_TIME, SELECT_MACHINE, WAIT_AMBIENT, WAIT_MACHINE, MONITORING, PLOT_VIEW };
+// Optiunile din meniul principal (ordinea = pozitia pe cercul de meniu)
+enum MenuOption  { MENU_TEST = 0, MENU_VIEW_DATA = 1, MENU_SETTINGS = 2, MENU_SHUTDOWN = 3, MENU_COUNT = 4 };
+
+// =====================================================
+// OBIECTE GLOBALE
+// =====================================================
+TFT_eSPI   tft    = TFT_eSPI();        // obiectul ecranului fizic
+TFT_eSprite sprite = TFT_eSprite(&tft);// buffer in memorie: desenam aici, apoi trimitem tot odata (fara palpaire)
+MMA8452Q   accel;                      // obiectul accelerometrului
+
+SPIClass spiSD(VSPI);                  // magistrala SPI dedicata cardului SD
+
+char currentLogFile[48] = "/log_1.csv";// numele fisierului de log curent (utilaj + data + ora)
+unsigned long logIndex = 1;            // contor de randuri scrise in fisierul curent
+
+double vReal[SAMPLES];                 // partea reala a semnalului pentru FFT microfon
+double vImag[SAMPLES];                 // partea imaginara (initial 0)
+
+// Obiectul FFT pentru microfon, legat la bufferele de mai sus
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQ);
+
+double ambientFFT[FFT_BINS]  = {0};    // spectrul zgomotului ambiant (Step 1 calibrare)
+double machineFFT[FFT_BINS]  = {0};    // spectrul invatat al masinii sanatoase (Step 2)
+double smoothedFFT[FFT_BINS] = {0};    // spectrul curent netezit (folosit in monitoring)
+
+// ===== Buffere FFT accelerometru =====
+double accReal[ACC_SAMPLES];           // partea reala pentru FFT-ul de vibratie
+double accImag[ACC_SAMPLES];           // partea imaginara pentru FFT-ul de vibratie
+// Obiectul FFT pentru vibratie (rata si marime proprii, diferite de microfon)
+ArduinoFFT<double> accFFT = ArduinoFFT<double>(accReal, accImag, ACC_SAMPLES, ACC_SAMPLE_HZ);
+
+double accelSpectrum[ACC_FFT_BINS]   = {0};   // spectrul curent de vibratie (pentru afisare)
+double learnedAccelFFT[ACC_FFT_BINS] = {0};   // spectrul de vibratie invatat la calibrare
+double sharedAccelFFT[ACC_FFT_BINS]  = {0};   // spectru de vibratie partajat intre task-uri
+volatile bool accelSpectrumReady = false;     // semnaleaza ca exista un spectru proaspat
+
+// buffer circular umplut de task-ul de esantionare accel
+volatile double accSampleBuf[ACC_SAMPLES];    // esantioanele brute de acceleratie (o axa)
+volatile int    accSampleIdx = 0;             // indexul curent in buffer
+volatile bool   accBufferFull = false;        // marcheaza umplerea unei ferestre complete
+int             accelAxis = 2;  // 0=X 1=Y 2=Z (se alege la calibrare in functie de montaj)
+
+// ultima citire completa a accelerometrului (scrisa de accelSamplingTask, citita de dspTask)
+volatile float lastAccX = 0.0f, lastAccY = 0.0f, lastAccZ = 0.0f;
+
+double    sharedFFT[FFT_BINS] = {0};   // spectrul microfon partajat (scris de dspTask)
+AccelData sharedAccel;                 // ultima acceleratie partajata
+SemaphoreHandle_t mutex     = nullptr; // protejeaza datele partajate intre task-uri
+SemaphoreHandle_t i2cMutex  = nullptr; // serializeaza accesul I2C (accel + RTC, evita coliziuni pe magistrala)
+volatile bool     sensorReady = false; // devine true cand exista primele date valide
+
+MountMode   currentMode    = TOP;       // orientarea de montaj curenta
+SystemState state          = MAIN_MENU; // ecranul activ la pornire
+MenuOption  selectedOption = MENU_TEST;  // optiunea selectata in meniu
+
+const int   SAMPLING_COUNTS[4]  = {133, 333, 666, 2000};        // numar de esantioane per durata de calibrare
+const char* SAMPLING_LABELS[4]  = {"2 SEC", "5 SEC", "10 SEC", "30 SEC"}; // etichete afisate
+int currentSamplingIndex = 1;           // durata de calibrare selectata (implicit 5 SEC)
+
+static int logicalMenuPosition = 0;     // pozitia logica in meniu (pentru rotatie)
+float currentAngle  = 0.0f;             // unghiul curent al animatiei meniului
+const float TOP_OFFSET = 180.0f;        // offset ca optiunea selectata sa fie afisata sus
+
+float offX = 0.0f, offY = 0.0f, offZ = 0.0f;          // offset-ul gravitatiei (zero-ul accelerometrului)
+float learnedPower = 0.0f, learnedVib = 0.0f, smoothVib = 0.0f; // referinte invatate + vibratie netezita
+float vibAlertLevel = 0.0f, healthScore = 100.0f, anomalyScore = 0.0f; // nivel alerta, scor sanatate, anomalie
+bool  isMachineOff  = false;            // true cand masina e considerata oprita (standby)
+
+unsigned long lastSerialSend = 0;       // momentul ultimei logari (ms)
+int sendInterval = SERIAL_INTERVAL_NORMAL_MS; // perioada curenta de logare
+
+// =====================================================
+// WIFI AP + WEB SERVER - STARE GLOBALA
+// Dispozitivul creeaza propria retea (Access Point); te conectezi la ea
+// si accesezi interfata web la adresa 192.168.4.1.
+// =====================================================
+#define WIFI_AP_SSID       "Mentprev"  // numele retelei WiFi create
+#define WIFI_AP_PASS       "12345678"  // parola (minim 8 caractere; "" = retea deschisa)
+#define WIFI_AP_CHANNEL    1           // canalul radio folosit
+
+bool          wifiEnabled    = false;  // setarea utilizatorului (WiFi pornit/oprit)
+bool          wifiStarted    = false;  // starea reala a AP-ului (a pornit efectiv?)
+volatile int  wifiClients    = 0;      // cati clienti sunt conectati la AP
+
+WebServer     webServer(80);           // serverul HTTP pe portul standard 80
+
+unsigned long lastLedBlink   = 0;      // momentul ultimei comutari a LED-ului WiFi
+bool          ledBlinkState  = false;  // starea curenta a LED-ului WiFi (aprins/stins)
+const unsigned long LED_BLINK_INTERVAL_MS = 400;  // intervalul de clipire al LED-ului WiFi (ms)
+
+unsigned long lastClientCheck = 0;     // momentul ultimei verificari a numarului de clienti
+const unsigned long CLIENT_CHECK_INTERVAL_MS = 1000; // la cat se reverifica clientii (ms)
+
+// =====================================================
+// PCF8563 RTC - STARE
+// =====================================================
+bool rtcAvailable = false;             // true daca ceasul RTC a fost gasit pe I2C
+
+// Structura de timp folosita intern (mai simpla decat formatul brut al cipului)
+struct RtcTime {
+  uint8_t sec, min, hour, day, month, year;
+};
+RtcTime rtcCache = {0, 0, 0, 1, 1, 25};      // ultima ora citita (cache, ca sa nu citim I2C prea des)
+unsigned long lastRtcRead = 0;               // momentul ultimei citiri RTC
+const unsigned long RTC_READ_INTERVAL_MS = 1000; // la cat reimprospatam ora (ms)
+
+// Campurile editabile in ecranul de setare a orei
+enum SetTimeField { SET_HOUR = 0, SET_MIN, SET_SEC, SET_DAY, SET_MONTH, SET_YEAR, SET_FIELD_COUNT };
+int     setTimeField = SET_HOUR;             // campul selectat curent la setarea orei
+uint8_t setTimeVals[SET_FIELD_COUNT];        // valorile temporare in timpul editarii
+
+// =====================================================
+// UTILAJE (nume pentru fisiere) + BACKLIGHT
+// Numele utilajelor sunt salvate permanent pe SD si selectate inainte de test.
+// =====================================================
+#define MAX_MACHINES     12            // numar maxim de utilaje salvate
+#define MACHINE_NAME_LEN 20            // lungime maxima a unui nume de utilaj
+#define MACHINES_FILE    "/utilaje.txt"// fisierul de pe SD unde se salveaza numele
+
+char machineNames[MAX_MACHINES][MACHINE_NAME_LEN]; // lista numelor de utilaje
+int  machineCount    = 0;             // cate utilaje sunt definite
+int  selectedMachine = 0;             // index in machineNames, ales inainte de test
+int  machineSelCursor = 0;            // cursorul pe ecranul de selectie utilaj
+
+bool backlightOn = true;              // starea backlight-ului (pin DISPLAY_PWR_PIN)
+
+// LED de stare (GPIO48): clipeste in monitoring cu ritm dependent de health
+unsigned long lastStatusBlink = 0;    // momentul ultimei comutari a LED-ului de stare
+bool          statusLedState  = false;// starea curenta a LED-ului de stare
+
+// Butoane virtuale din pagina web (injecteaza apasari in masina de stari)
+volatile bool webNavShort = false;    // = NAV scurt (Next), setat de handler-ul web
+volatile bool webNavLong  = false;    // = NAV lung  (Select/Start/Confirm), setat de handler-ul web
+
+// =====================================================
+// FILE BROWSER - stare navigare fisiere
+// =====================================================
+#define MAX_LOG_FILES 50              // numar maxim de fisiere listate
+#define FILES_PER_PAGE 5              // cate fisiere se vad simultan pe ecran
+
+char logFileList[MAX_LOG_FILES][48];  // lista numelor de fisiere .csv gasite pe SD
+int  logFileCount  = 0;               // cate fisiere au fost gasite
+int  browserCursor = 0;               // fisierul selectat in browser
+int  browserScroll = 0;               // primul fisier vizibil (pentru derulare)
+int  plotCursor    = 0;               // fisierul afisat in vizualizarea grafic
+
+// =====================================================
+// SETTINGS - navigare intre optiuni
+// =====================================================
+enum SettingsItem { SET_ITEM_SAMPLING = 0, SET_ITEM_WIFI, SET_ITEM_TIME, SET_ITEM_COUNT };
+int settingsCursor = SET_ITEM_SAMPLING; // optiunea selectata in meniul de setari
+
+// =====================================================
+// BUTOANE - structura si logica de debounce
+// =====================================================
+struct Button {
+  int           pin;                        // pinul fizic al butonului
+  bool          lastReading, stableState;   // ultima citire bruta + starea stabila confirmata
+  unsigned long lastDebounce, pressStart;   // momentul ultimei schimbari + inceputul apasarii
+  bool          wasPressed, longFired;      // apasare in evaluare + apasarea lunga deja raportata
+};
+
+// Butoanele active LOW (INPUT_PULLUP): apasat = LOW, eliberat = HIGH
+Button navBtn = { NAV_BTN_PIN, HIGH, HIGH, 0, 0, false, false };
+Button pwrBtn = { PWR_BTN_PIN, HIGH, HIGH, 0, 0, false, false };
+
+// Actualizeaza starea unui buton cu anti-debounce (filtreaza tranzitiile false)
+void updateButton(Button& b) {
+  bool reading = digitalRead(b.pin);                  // citire bruta
+  if (reading != b.lastReading) b.lastDebounce = millis(); // s-a schimbat -> resetam timer-ul
+  b.lastReading = reading;
+  if ((millis() - b.lastDebounce) > DEBOUNCE_MS) {    // citirea s-a stabilizat suficient
+    if (reading != b.stableState) {
+      b.stableState = reading;
+      if (b.stableState == LOW) {                     // tranzitie spre apasat
+        b.pressStart = millis();                      // retinem cand a inceput apasarea
+        b.wasPressed = true;
+        b.longFired  = false;
+      }
+    }
+  }
+}
+
+// Detecteaza o apasare SCURTA: eliberata inainte de prag si fara sa fi declansat "lung"
+bool clickShort(Button& b, unsigned long threshold) {
+  updateButton(b);
+  if (b.wasPressed && b.stableState == HIGH && !b.longFired) { // a fost eliberat
+    if (millis() - b.pressStart < threshold) { b.wasPressed = false; return true; } // sub prag = scurt
+    b.wasPressed = false;
+  }
+  return false;
+}
+
+// Detecteaza o apasare LUNGA: tinuta apasata peste prag (se declanseaza o singura data)
+bool clickLong(Button& b, unsigned long threshold) {
+  updateButton(b);
+  if (b.wasPressed && b.stableState == LOW && !b.longFired) {  // inca apasat
+    if (millis() - b.pressStart >= threshold) { b.longFired = true; return true; } // peste prag = lung
+  }
+  return false;
+}
+
+// Wrappere: NAV scurt/lung = buton fizic SAU buton virtual din web.
+// Astfel orice ecran reactioneaza identic la apasare fizica sau web,
+// iar dispozitivul si pagina raman in sincron (aceeasi masina de stari).
+bool navShort() {
+  bool phys = clickShort(navBtn, NAV_LONG_MS);              // intai verificam butonul fizic
+  if (webNavShort) { webNavShort = false; return true; }   // apoi flag-ul web (consumat o data)
+  return phys;
+}
+bool navLong() {
+  bool phys = clickLong(navBtn, NAV_LONG_MS);
+  if (webNavLong) { webNavLong = false; return true; }
+  return phys;
+}
+
+// =====================================================
+// PCF8563 - FUNCTII
+// Cipul stocheaza timpul in format BCD (fiecare cifra zecimala pe 4 biti),
+// deci convertim inainte/dupa fiecare citire/scriere.
+// =====================================================
+static inline uint8_t bcdToDecPcf(uint8_t bcd) { return ((bcd >> 4) * 10) + (bcd & 0x0F); } // BCD -> zecimal
+static inline uint8_t decToBcdPcf(uint8_t dec)  { return ((dec / 10) << 4) | (dec % 10); }   // zecimal -> BCD
+
+// Initializeaza RTC-ul: verifica prezenta pe I2C si reseteaza registrele de control
+bool initRTC() {
+  Wire.beginTransmission(PCF8563_ADDR);
+  if (Wire.endTransmission() != 0) return false;   // nu raspunde -> nu exista RTC
+  Wire.beginTransmission(PCF8563_ADDR);
+  Wire.write(PCF8563_REG_STATUS1);
+  Wire.write(0x00);                                // control 1 = normal
+  Wire.write(0x00);                                // control 2 = fara intreruperi
+  Wire.endTransmission();
+  return true;
+}
+
+// Citeste data si ora din RTC in structura data
+bool rtcRead(RtcTime& t) {
+  Wire.beginTransmission(PCF8563_ADDR);
+  Wire.write(PCF8563_REG_VL_SEC);                  // pornim de la registrul de secunde
+  if (Wire.endTransmission(false) != 0) return false; // repeated start, fara stop
+  Wire.requestFrom((uint8_t)PCF8563_ADDR, (uint8_t)7); // citim 7 registre consecutive
+  if (Wire.available() < 7) return false;
+  uint8_t sec_r = Wire.read(), min_r = Wire.read(), hour_r = Wire.read(), day_r = Wire.read();
+  Wire.read();                                     // weekday - ignorat (il recalculam la scriere)
+  uint8_t mon_r = Wire.read(), year_r = Wire.read();
+  // Mascam bitii de stare/rezerva inainte de conversie (fiecare registru are biti utili specifici)
+  t.sec   = bcdToDecPcf(sec_r   & 0x7F);
+  t.min   = bcdToDecPcf(min_r   & 0x7F);
+  t.hour  = bcdToDecPcf(hour_r  & 0x3F);
+  t.day   = bcdToDecPcf(day_r   & 0x3F);
+  t.month = bcdToDecPcf(mon_r   & 0x1F);
+  t.year  = bcdToDecPcf(year_r);
+  return true;
+}
+
+// Scrie data si ora in RTC; recalculeaza ziua saptamanii cu algoritmul lui Zeller
+bool rtcWrite(const RtcTime& t) {
+  int d = t.day, m = t.month, y = 2000 + t.year;
+  if (m < 3) { m += 12; y--; }                     // ian/feb tratate ca lunile 13/14 ale anului precedent
+  int k = y % 100, j = y / 100;
+  int dow = ((d + (13*(m+1)/5) + k + k/4 + j/4 + 5*j) % 7 + 6) % 7; // ziua saptamanii (0=luni)
+  Wire.beginTransmission(PCF8563_ADDR);
+  Wire.write(PCF8563_REG_VL_SEC);
+  Wire.write(decToBcdPcf(t.sec)   & 0x7F);
+  Wire.write(decToBcdPcf(t.min)   & 0x7F);
+  Wire.write(decToBcdPcf(t.hour)  & 0x3F);
+  Wire.write(decToBcdPcf(t.day)   & 0x3F);
+  Wire.write(dow                  & 0x07);
+  Wire.write(decToBcdPcf(t.month) & 0x1F);
+  Wire.write(decToBcdPcf(t.year));
+  return (Wire.endTransmission() == 0);
+}
+
+// Reimprospateaza cache-ul de ora periodic (nu la fiecare cadru, ci o data pe secunda)
+void updateRtcCache() {
+  if (!rtcAvailable) return;
+  if (millis() - lastRtcRead >= RTC_READ_INTERVAL_MS) {
+    // protejam accesul I2C cu mutex (accelerometrul foloseste aceeasi magistrala)
+    if (i2cMutex == nullptr || xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      rtcRead(rtcCache);
+      if (i2cMutex != nullptr) xSemaphoreGive(i2cMutex);
+    }
+    lastRtcRead = millis();
+  }
+}
+
+// Formateaza data ca text "AAAA-LL-ZZ" pentru log
+void rtcDateString(char* buf, size_t n) {
+  if (rtcAvailable)
+    snprintf(buf, n, "20%02d-%02d-%02d", rtcCache.year, rtcCache.month, rtcCache.day);
+  else
+    snprintf(buf, n, "0000-00-00");                // RTC absent -> data nula
+}
+// Formateaza ora ca text "HH:MM:SS" pentru log
+void rtcTimeString(char* buf, size_t n) {
+  if (rtcAvailable)
+    snprintf(buf, n, "%02d:%02d:%02d", rtcCache.hour, rtcCache.min, rtcCache.sec);
+  else
+    snprintf(buf, n, "00:00:00");
+}
+
+// =====================================================
+// PROTOTIPURI
+// Declaratiile permit apelarea functiilor inainte de definitia lor in fisier.
+// =====================================================
+bool initAccelerometer();
+bool initDisplay();
+bool initSDCard();
+bool initI2S();
+bool initMutex();
+void dspTask(void* pvParameters);                  // task microfon + FFT (core 0)
+void accelSamplingTask(void* pvParameters);        // task esantionare accelerometru (core 0)
+void computeAccelFFT();
+int  selectAccelAxis(MountMode mode);
+bool getSharedSnapshot(double* fftOut, AccelData* accelOut);
+void clearBuffers();
+void drawCenteredMessage(const char* line1, const char* line2, uint16_t color);
+void drawProgressScreen(const char* label, int step, int total);
+bool runCalibration(double* targetBuffer, bool captureOffsetsAndOrientation, bool captureLearnedVibration);
+float computeCleanPower(const double* spectrum, int startBin, int endBin, float gateThreshold);
+void updateMonitoring(const double* currentRaw, const AccelData& e);
+void drawMonitoringUI(float dispX, float dispY, const char* mountName, uint16_t color, float vibLevel);
+MountMode detectMountModeFromGravity(float ax, float ay, float az);
+const char* mountModeToString(MountMode mode);
+void prepareNextLogFile();
+void logDataToSD(int hScore, float pwr, float sVib, float vAlert, float aScore,
+                 const AccelData& e, const double* rawFFT, const double* accFFTspec);
+void drawPlotFromSD(const char* filepath);
+void drawMainMenu();
+void drawSettingsView();
+void drawSetTimeView();
+void playMenuTransitionIn(bool showHello);
+void playMenuTransitionOut();
+void doShutdown();
+void scanLogFiles();
+void drawFileBrowser();
+void drawCircularClipBorder(uint16_t color);
+bool isInsideCircle(int x, int y, int cx, int cy, int r);
+void drawInitErrorScreen(bool okDisplay, bool okAccel, bool okSD, bool okI2S, bool okMutex);
+void wifiStart();
+void wifiStop();
+void updateWifiLed();
+void setupWebRoutes();
+void handleWebRoot();
+void handleWebList();
+void handleWebDownload();
+void handleWebDelete();
+void handleWebStatus();
+void handleWebSettings();
+void handleWebSetSampling();
+void handleWebSetTime();
+void loadMachineNames();
+void saveMachineNames();
+void handleWebMachines();
+void handleWebAddMachine();
+void handleWebDelMachine();
+void drawSelectMachine();
+void buildLogFileName();
+void updateStatusLed();
+bool navShort();
+bool navLong();
+void handleWebButton();
+
+// =====================================================
+// SETUP - ruleaza o singura data la pornire
+// =====================================================
+void setup() {
+  pinMode(PWR_HOLD_PIN, OUTPUT);
+  digitalWrite(PWR_HOLD_PIN, HIGH);   // tinem alimentarea pornita (latch de power)
+  pinMode(DISPLAY_PWR_PIN, OUTPUT);
+  digitalWrite(DISPLAY_PWR_PIN, LOW); // aprindem backlight-ul (LOW = aprins)
+
+  pinMode(WIFI_LED_PIN, OUTPUT);
+  digitalWrite(WIFI_LED_PIN, LOW);    // LED WiFi stins initial
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);  // LED de stare stins initial
+  delay(50);
+
+  Serial.begin(115200);               // port serial pentru debug
+  pinMode(PWR_BTN_PIN, INPUT_PULLUP); // butoane active LOW
+  pinMode(NAV_BTN_PIN, INPUT_PULLUP);
+  WiFi.mode(WIFI_OFF);                // pornim cu WiFi oprit (il aprinde utilizatorul)
+
+  // Initializarea perifericelor; fiecare intoarce true/false dupa succes
+  bool okDisplay = initDisplay();
+  bool okSD      = initSDCard();
+  bool okAccel   = initAccelerometer();
+  bool okMutex   = initMutex();
+  bool okI2S     = initI2S();
+
+  rtcAvailable = initRTC();           // RTC e optional
+  if (rtcAvailable) {
+    rtcRead(rtcCache);
+    lastRtcRead = millis();
+    Serial.println("PCF8563 RTC: OK");
+  } else {
+    Serial.println("PCF8563 RTC: NOT FOUND (optional)");
+  }
+
+  if (okSD) prepareNextLogFile();     // pregatim un nume de fisier de rezerva
+  if (okSD) loadMachineNames();       // incarcam numele de utilaje salvate
+
+  // Daca un periferic esential lipseste, afisam ecranul de eroare si ne oprim aici
+  if (!okDisplay || !okAccel || !okMutex || !okI2S || !okSD) {
+    drawInitErrorScreen(okDisplay, okAccel, okSD, okI2S, okMutex);
+    while (true) delay(1000);
+  }
+
+  clearBuffers();                     // resetam toate datele de calibrare/monitoring
+  // Task microfon + FFT pe core 0, prioritate 1
+  xTaskCreatePinnedToCore(dspTask, "DSP", 8192, NULL, 1, NULL, 0);
+  // Task de esantionare accelerometru la rata fixa. Prioritate 1 
+  // pe core 0 impreuna cu DSP 
+  xTaskCreatePinnedToCore(accelSamplingTask, "ACC", 6144, NULL, 1, NULL, 0);
+  playMenuTransitionIn(true);         // animatie de intrare + logo
+
+  state               = MAIN_MENU;    // pornim in meniul principal
+  selectedOption      = MENU_TEST;
+  logicalMenuPosition = 0;
+  currentAngle        = 0.0f;
+}
+
+// =====================================================
+// WIFI AP + WEB SERVER
+// =====================================================
+// Porneste Access Point-ul si serverul web
+void wifiStart() {
+  if (wifiStarted) return;            // deja pornit
+  WiFi.mode(WIFI_AP);
+  bool ok;
+  if (strlen(WIFI_AP_PASS) >= 8)
+    ok = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, WIFI_AP_CHANNEL); // retea protejata
+  else
+    ok = WiFi.softAP(WIFI_AP_SSID);   // retea deschisa daca parola e prea scurta
+  if (!ok) { Serial.println("WiFi AP: start FAIL"); return; }
+
+  setupWebRoutes();                   // inregistram rutele HTTP
+  webServer.begin();
+  wifiStarted = true;
+  wifiClients = 0;
+  Serial.print("WiFi AP pornit. IP: ");
+  Serial.println(WiFi.softAPIP());    // de regula 192.168.4.1
+}
+
+// Opreste Access Point-ul si serverul web, elibereaza resursele
+void wifiStop() {
+  if (!wifiStarted) return;
+  webServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiStarted = false;
+  wifiClients = 0;
+  digitalWrite(WIFI_LED_PIN, LOW);    // stingem LED-ul WiFi
+  Serial.println("WiFi AP oprit.");
+}
+
+// LED: clipeste cand AP pornit dar fara clienti, fix aprins cand are cel putin un client
+void updateWifiLed() {
+  if (!wifiEnabled || !wifiStarted) {
+    digitalWrite(WIFI_LED_PIN, LOW);  // WiFi oprit -> LED stins
+    return;
+  }
+  // actualizeaza numarul de clienti din cand in cand
+  if (millis() - lastClientCheck >= CLIENT_CHECK_INTERVAL_MS) {
+    lastClientCheck = millis();
+    wifiClients = WiFi.softAPgetStationNum();
+  }
+  if (wifiClients > 0) {
+    digitalWrite(WIFI_LED_PIN, HIGH);  // client conectat -> fix aprins
+  } else {
+    // niciun client -> clipire pentru a semnala "AP activ, in asteptare"
+    if (millis() - lastLedBlink >= LED_BLINK_INTERVAL_MS) {
+      lastLedBlink = millis();
+      ledBlinkState = !ledBlinkState;
+      digitalWrite(WIFI_LED_PIN, ledBlinkState ? HIGH : LOW);
+    }
+  }
+}
+
+// LED de stare GPIO48: activ DOAR in monitoring.
+// Ritm de clipire in functie de health; aprins fix in standby; stins in rest.
+void updateStatusLed() {
+  // in afara monitorizarii: LED stins
+  if (state != MONITORING) {
+    if (statusLedState) { statusLedState = false; digitalWrite(STATUS_LED_PIN, LOW); }
+    return;
+  }
+
+  // standby (masina oprita): aprins fix
+  if (isMachineOff) {
+    if (!statusLedState) { statusLedState = true; digitalWrite(STATUS_LED_PIN, HIGH); }
+    return;
+  }
+
+  // altfel: clipire cu interval dependent de health (mai mic interval = mai rapid)
+  unsigned long interval;
+  if      (healthScore > 75.0f) interval = 1000;  // OK -> clipire lenta
+  else if (healthScore > 45.0f) interval = 400;   // atentie -> clipire medie
+  else                          interval = 120;   // alerta -> clipire rapida
+
+  if (millis() - lastStatusBlink >= interval) {
+    lastStatusBlink = millis();
+    statusLedState = !statusLedState;
+    digitalWrite(STATUS_LED_PIN, statusLedState ? HIGH : LOW);
+  }
+}
+
+// ---------- RUTE WEB ----------
+// Asociaza fiecare adresa URL cu functia care o trateaza
+void setupWebRoutes() {
+  webServer.on("/",            HTTP_GET, handleWebRoot);        // pagina principala
+  webServer.on("/list",        HTTP_GET, handleWebList);        // lista fisiere (JSON)
+  webServer.on("/download",    HTTP_GET, handleWebDownload);    // descarca un fisier
+  webServer.on("/delete",      HTTP_GET, handleWebDelete);      // sterge un fisier
+  webServer.on("/status",      HTTP_GET, handleWebStatus);      // status live (JSON)
+  webServer.on("/settings",    HTTP_GET, handleWebSettings);    // pagina de setari
+  webServer.on("/setsampling", HTTP_GET, handleWebSetSampling); // schimba durata sampling
+  webServer.on("/settime",     HTTP_GET, handleWebSetTime);     // seteaza ora RTC
+  webServer.on("/machines",    HTTP_GET, handleWebMachines);    // gestionare utilaje
+  webServer.on("/addmachine",  HTTP_GET, handleWebAddMachine);  // adauga utilaj
+  webServer.on("/delmachine",  HTTP_GET, handleWebDelMachine);  // sterge utilaj
+  webServer.on("/btn",         HTTP_GET, handleWebButton);      // buton virtual (telecomanda)
+  webServer.onNotFound([]() { webServer.send(404, "text/plain", "404"); }); // ruta inexistenta
+}
+
+// Pagina principala: status live, butoane de control, lista fisiere, link setari.
+// HTML-ul e trimis ca un singur sir; JavaScript-ul foloseste XMLHttpRequest
+// secvential (nu paralel), fiindca serverul accepta o singura conexiune odata.
+void handleWebRoot() {
+  String html = F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Mentprev</title><style>"
+    "body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:16px;}"
+    "h1{color:#0cf;font-size:22px;}h2{color:#0fc;font-size:17px;margin-top:24px;}"
+    "a{color:#0cf;}.card{background:#1c1c1c;border-radius:8px;padding:12px;margin:8px 0;}"
+    "table{width:100%;border-collapse:collapse;}td,th{padding:6px;border-bottom:1px solid #333;text-align:left;}"
+    ".btn{background:#0a84ff;color:#fff;border:none;padding:6px 12px;border-radius:6px;text-decoration:none;display:inline-block;margin:2px;}"
+    ".del{background:#ff453a;}.stat{font-size:28px;color:#0fc;}.err{color:#ff6b6b;}"
+    "</style></head><body>"
+    "<h1>Mentprev</h1>"
+    "<div class='card'><h2>Live Status</h2><div id='st'>loading...</div></div>"
+    "<div class='card'><h2>Control</h2>"
+    "<button class='btn' onclick=\"btn('next')\">NEXT</button> "
+    "<button class='btn' onclick=\"btn('sel')\">SELECT / START</button>"
+    "<p style='color:#888;font-size:13px'>NEXT = navigate / SELECT = confirm</p></div>"
+    "<div class='card'><h2>Log files</h2><div id='files'>loading...</div></div>"
+    "<div class='card'><h2>Settings</h2><a class='btn' href='/settings'>Open settings</a></div>"
+    "<script>"
+    // req: helper generic de cerere asincrona cu tratare de erori si timeout
+    "function req(url,cb,errcb){"
+    "var x=new XMLHttpRequest();"
+    "x.open('GET',url,true);x.timeout=8000;"
+    "x.onreadystatechange=function(){"
+    "if(x.readyState==4){"
+    "if(x.status==200){try{cb(JSON.parse(x.responseText));}catch(e){errcb('json err');}}"
+    "else{errcb('http '+x.status);}}};"
+    "x.ontimeout=function(){errcb('timeout');};"
+    "x.onerror=function(){errcb('net err');};"
+    "x.send();}"
+    // btn: trimite o apasare de buton virtual catre dispozitiv
+    "function btn(b){var x=new XMLHttpRequest();x.open('GET','/btn?b='+b,true);x.send();}"
+    // loadStatus: cere /status si afiseaza health, vibratie, anomalie, stare
+    "function loadStatus(next){"
+    "req('/status',function(d){"
+    "document.getElementById('st').innerHTML="
+    "'<span class=stat>'+d.health+'%</span> health<br>Vibratie: '+d.vib+'<br>Anomaly: '+d.anomaly+'<br>State: '+d.machine;"
+    "if(next)next();},"
+    "function(e){document.getElementById('st').innerHTML='<span class=err>status: '+e+'</span>';if(next)next();});}"
+    // loadList: cere /list si construieste tabelul de fisiere cu butoane GET/DEL
+    "function loadList(){"
+    "req('/list',function(d){"
+    "var h='<table><tr><th>File</th><th>Dimension</th><th></th></tr>';"
+    "d.files.forEach(function(f){"
+    "h+='<tr><td>'+f.name+'</td><td>'+f.size+'</td><td>'+"
+    "'<a class=btn href=\"/download?f='+f.name+'\">GET</a>'+"
+    "'<a class=\"btn del\" href=\"/delete?f='+f.name+'\" onclick=\"return confirm(\\'Sterg '+f.name+'?\\')\">DEL</a>'+"
+    "'</td></tr>';});"
+    "h+='</table>';if(d.files.length==0)h='<i>no file</i>';"
+    "document.getElementById('files').innerHTML=h;},"
+    "function(e){document.getElementById('files').innerHTML='<span class=err>lista: '+e+'</span>';});}"
+    // cycle: status apoi lista (secvential); status se reia automat la 3s
+    "function cycle(){loadStatus(loadList);}"
+    "cycle();setInterval(loadStatus,3000);"
+    "</script></body></html>");
+  webServer.send(200, "text/html", html);
+}
+
+// Lista fisierelor .csv ca JSON (nume + dimensiune), consumata de pagina principala
+void handleWebList() {
+  scanLogFiles();                                    // reciteste fisierele de pe SD
+  String json = "{\"files\":[";
+  for (int i = 0; i < logFileCount; i++) {
+    File f = SD.open(logFileList[i], FILE_READ);
+    uint32_t sz = 0;
+    if (f) { sz = f.size(); f.close(); }             // citim dimensiunea
+    char szBuf[16];
+    if (sz < 1024) snprintf(szBuf, sizeof(szBuf), "%lu B", sz);       // sub 1 KB -> bytes
+    else           snprintf(szBuf, sizeof(szBuf), "%lu KB", sz / 1024);// altfel KB
+    if (i > 0) json += ",";
+    json += "{\"name\":\"";
+    json += (logFileList[i] + 1);                    // +1 sare peste '/' din fata
+    json += "\",\"size\":\"";
+    json += szBuf;
+    json += "\"}";
+  }
+  json += "]}";
+  webServer.send(200, "application/json", json);
+}
+
+// Descarca un fisier de pe SD ca atasament (parametru ?f=nume)
+void handleWebDownload() {
+  if (!webServer.hasArg("f")) { webServer.send(400, "text/plain", "lipsa parametru f"); return; }
+  String name = webServer.arg("f");
+  String path = "/" + name;
+  File f = SD.open(path, FILE_READ);
+  if (!f) { webServer.send(404, "text/plain", "fisier inexistent"); return; }
+  webServer.sendHeader("Content-Disposition", "attachment; filename=" + name); // forteaza download
+  webServer.streamFile(f, "text/csv");               // trimite continutul fisierului
+  f.close();
+}
+
+// Sterge un fisier de pe SD (parametru ?f=nume), apoi redirectioneaza la pagina principala
+void handleWebDelete() {
+  if (!webServer.hasArg("f")) { webServer.send(400, "text/plain", "lipsa parametru f"); return; }
+  String path = "/" + webServer.arg("f");
+  bool ok = SD.remove(path);
+  webServer.sendHeader("Location", "/");
+  webServer.send(303, "text/plain", ok ? "sters" : "eroare");
+}
+
+// Status live ca JSON: health, vibratie, anomalie, stare masina
+void handleWebStatus() {
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+    "{\"health\":%d,\"vib\":\"%.3f\",\"anomaly\":\"%.1f\",\"machine\":\"%s\"}",
+    (int)healthScore, smoothVib, anomalyScore,
+    isMachineOff ? "STANDBY" : "RUNNING");
+  webServer.send(200, "application/json", buf);
+}
+
+// Pagina de setari: durata sampling, ceas RTC, link spre gestionare utilaje
+void handleWebSettings() {
+  char timeBuf[24], dateBuf[24];
+  rtcTimeString(timeBuf, sizeof(timeBuf));
+  rtcDateString(dateBuf, sizeof(dateBuf));
+
+  String html = F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Settings</title><style>"
+    "body{font-family:sans-serif;background:#111;color:#eee;padding:16px;}"
+    "h1{color:#0cf;}a{color:#0cf;}.card{background:#1c1c1c;border-radius:8px;padding:12px;margin:8px 0;}"
+    "select,input{padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee;}"
+    ".btn{background:#0a84ff;color:#fff;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;}"
+    "</style></head><body><h1>Settings</h1>"
+    "<div class='card'><h3>Sampling duration</h3>"
+    "<form action='/setsampling'><select name='i'>"
+    "<option value=0>2 SEC</option><option value=1>5 SEC</option>"
+    "<option value=2>10 SEC</option><option value=3>30 SEC</option>"
+    "</select> <button class='btn'>Save</button></form>"
+    "<p>Current: ");
+  html += SAMPLING_LABELS[currentSamplingIndex];     // afiseaza durata curenta
+  html += F("</p></div>"
+    "<div class='card'><h3>RTC</h3><p>Now: ");
+  html += String(dateBuf) + " " + String(timeBuf);   // afiseaza data si ora curenta
+  html += F("</p>"
+    "<form action='/settime'>"
+    "Date (YYYY-MM-DD): <input name='d' placeholder='2026-06-15'><br><br>"
+    "Hour (HH:MM:SS): <input name='t' placeholder='14:30:00'><br><br>"
+    "<button class='btn'>Set hour</button></form></div>"
+    "<div class='card'><h3>Equipments</h3><a class='btn' href='/machines'>Set equipments</a></div>"
+    "<p><a href='/'>&larr; Go back</a></p></body></html>");
+  webServer.send(200, "text/html", html);
+}
+
+// Aplica durata de sampling aleasa (parametru ?i=index 0..3)
+void handleWebSetSampling() {
+  if (webServer.hasArg("i")) {
+    int idx = webServer.arg("i").toInt();
+    if (idx >= 0 && idx < 4) currentSamplingIndex = idx;
+  }
+  webServer.sendHeader("Location", "/settings");
+  webServer.send(303, "text/plain", "ok");
+}
+
+// Seteaza ora RTC din web (parametri ?d=data ?t=ora)
+void handleWebSetTime() {
+  if (rtcAvailable && webServer.hasArg("d") && webServer.hasArg("t")) {
+    String d = webServer.arg("d");   // AAAA-LL-ZZ
+    String t = webServer.arg("t");   // HH:MM:SS
+    if (d.length() >= 10 && t.length() >= 8) {       // validare minimala de lungime
+      RtcTime nt;
+      nt.year  = d.substring(2,4).toInt();           // luam ultimele doua cifre ale anului
+      nt.month = d.substring(5,7).toInt();
+      nt.day   = d.substring(8,10).toInt();
+      nt.hour  = t.substring(0,2).toInt();
+      nt.min   = t.substring(3,5).toInt();
+      nt.sec   = t.substring(6,8).toInt();
+      if (rtcWrite(nt)) rtcCache = nt;               // scriem in RTC si actualizam cache-ul
+    }
+  }
+  webServer.sendHeader("Location", "/settings");
+  webServer.send(303, "text/plain", "ok");
+}
+
+// Pagina de gestionare utilaje: formular de adaugare + lista cu buton de stergere
+void handleWebMachines() {
+  String html = F(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Equipments</title><style>"
+    "body{font-family:sans-serif;background:#111;color:#eee;padding:16px;}"
+    "h1{color:#0cf;}a{color:#0cf;}.card{background:#1c1c1c;border-radius:8px;padding:12px;margin:8px 0;}"
+    "input{padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee;}"
+    ".btn{background:#0a84ff;color:#fff;border:none;padding:8px 14px;border-radius:6px;text-decoration:none;display:inline-block;}"
+    ".del{background:#ff453a;}table{width:100%;border-collapse:collapse;}"
+    "td{padding:6px;border-bottom:1px solid #333;}"
+    "</style></head><body><h1>Equipments</h1>"
+    "<div class='card'><h3>Add equipments</h3>"
+    "<form action='/addmachine'>"
+    "<input name='n' maxlength='19' placeholder='name'> "
+    "<button class='btn'>Add</button></form></div>"
+    "<div class='card'><h3>List</h3><table>");
+
+  // construim cate un rand pentru fiecare utilaj definit
+  for (int i = 0; i < machineCount; i++) {
+    html += "<tr><td>";
+    html += machineNames[i];
+    html += "</td><td><a class='btn del' href='/delmachine?i=";
+    html += String(i);                               // indexul de sters
+    html += "'>X</a></td></tr>";
+  }
+  if (machineCount == 0) html += "<tr><td><i>niciun utilaj</i></td></tr>";
+
+  html += F("</table></div>"
+    "<p><a href='/settings'>&larr; Go back</a></p></body></html>");
+  webServer.send(200, "text/html", html);
+}
+
+// Adauga un utilaj nou (parametru ?n=nume) si il salveaza pe SD
+void handleWebAddMachine() {
+  if (webServer.hasArg("n") && machineCount < MAX_MACHINES) {
+    String n = webServer.arg("n");
+    n.trim();
+    if (n.length() > 0) {
+      n.toCharArray(machineNames[machineCount], MACHINE_NAME_LEN);
+      machineCount++;
+      saveMachineNames();                            // persistam pe card
+    }
+  }
+  webServer.sendHeader("Location", "/machines");
+  webServer.send(303, "text/plain", "ok");
+}
+
+// Sterge un utilaj (parametru ?i=index) si rescrie lista pe SD
+void handleWebDelMachine() {
+  if (webServer.hasArg("i")) {
+    int idx = webServer.arg("i").toInt();
+    if (idx >= 0 && idx < machineCount) {
+      // deplasam toate elementele de dupa index cu o pozitie in stanga
+      for (int j = idx; j < machineCount - 1; j++)
+        strncpy(machineNames[j], machineNames[j+1], MACHINE_NAME_LEN);
+      machineCount--;
+      if (selectedMachine >= machineCount) selectedMachine = max(0, machineCount - 1); // corectam selectia
+      saveMachineNames();
+    }
+  }
+  webServer.sendHeader("Location", "/machines");
+  webServer.send(303, "text/plain", "ok");
+}
+
+// Buton virtual din web: seteaza flag-ul, loop() il trateaza ca apasare fizica
+void handleWebButton() {
+  String b = webServer.hasArg("b") ? webServer.arg("b") : "";
+  if      (b == "next") webNavShort = true;   // NAV scurt
+  else if (b == "sel")  webNavLong  = true;   // NAV lung (confirma/start)
+  webServer.send(200, "text/plain", "ok");
+}
+
+// =====================================================
+// UTILAJE - incarcare/salvare pe SD + nume fisier
+// =====================================================
+// Citeste numele utilajelor din fisierul de pe SD (cate unul pe linie)
+void loadMachineNames() {
+  machineCount = 0;
+  File f = SD.open(MACHINES_FILE, FILE_READ);
+  if (!f) return;                                    // fisier inexistent -> niciun utilaj
+  while (f.available() && machineCount < MAX_MACHINES) {
+    String line = f.readStringUntil('\n');
+    line.trim();                                     // eliminam spatii/CR
+    if (line.length() == 0) continue;                // sarim liniile goale
+    line.toCharArray(machineNames[machineCount], MACHINE_NAME_LEN);
+    machineCount++;
+  }
+  f.close();
+  Serial.printf("Utilaje incarcate: %d\n", machineCount);
+}
+
+// Rescrie complet fisierul de utilaje pe SD (suprascriere)
+void saveMachineNames() {
+  // suprascriem fisierul
+  if (SD.exists(MACHINES_FILE)) SD.remove(MACHINES_FILE);
+  File f = SD.open(MACHINES_FILE, FILE_WRITE);
+  if (!f) return;
+  for (int i = 0; i < machineCount; i++) f.println(machineNames[i]);
+  f.close();
+}
+
+// Construieste numele fisierului de log: "/utilaj_AAAALLZZ_HHMM.csv"
+void buildLogFileName() {
+  char nameClean[MACHINE_NAME_LEN];
+  if (machineCount > 0 && selectedMachine < machineCount) {
+    strncpy(nameClean, machineNames[selectedMachine], MACHINE_NAME_LEN);
+    nameClean[MACHINE_NAME_LEN - 1] = '\0';          // garantam terminarea sirului
+  } else {
+    strcpy(nameClean, "log");                        // fara utilaj selectat -> nume generic
+  }
+  // inlocuim spatiile cu _ ca sa fie nume de fisier valid
+  for (char* p = nameClean; *p; p++) if (*p == ' ') *p = '_';
+
+  if (rtcAvailable) {
+    // nume cu data si ora reala -> fisiere auto-documentate si unice
+    snprintf(currentLogFile, sizeof(currentLogFile), "/%s_20%02d%02d%02d_%02d%02d.csv",
+             nameClean, rtcCache.year, rtcCache.month, rtcCache.day,
+             rtcCache.hour, rtcCache.min);
+  } else {
+    // fara RTC, folosim un index ca sa nu suprascriem fisiere existente
+    int n = 1;
+    do {
+      snprintf(currentLogFile, sizeof(currentLogFile), "/%s_%d.csv", nameClean, n);
+      n++;
+    } while (SD.exists(currentLogFile) && n < 999);
+  }
+  logIndex = 1;                                      // resetam contorul de randuri
+}
+
+// =====================================================
+// SELECT MACHINE UI - ecranul de alegere a utilajului inainte de test
+// =====================================================
+void drawSelectMachine() {
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString("EQUIPMENT", SCREEN_CX, 30, 2);
+  sprite.drawFastHLine(40, 44, 160, TFT_DARKGREY);
+
+  // afisam pana la 3 utilaje in jurul cursorului (fereastra glisanta)
+  int start = machineSelCursor - 1;
+  if (start < 0) start = 0;
+  if (start > machineCount - 3) start = max(0, machineCount - 3);
+
+  const int rowY[3] = {90, 120, 150};                // pozitiile verticale ale celor 3 randuri
+  for (int i = 0; i < 3; i++) {
+    int idx = start + i;
+    if (idx >= machineCount) break;
+    bool sel = (idx == machineSelCursor);            // utilajul curent selectat
+    if (sel) {
+      sprite.fillRoundRect(40, rowY[i]-13, 160, 26, 6, sprite.color565(0,60,30));
+      sprite.drawRoundRect(40, rowY[i]-13, 160, 26, 6, TFT_GREEN);
+    }
+    sprite.setTextColor(sel ? TFT_GREEN : sprite.color565(120,120,120));
+    sprite.drawString(machineNames[idx], SCREEN_CX, rowY[i], 2);
+  }
+
+  char posBuf[16]; sprintf(posBuf, "%d / %d", machineSelCursor+1, machineCount); // indicator pozitie
+  sprite.setTextColor(TFT_DARKGREY);
+  sprite.drawString(posBuf, SCREEN_CX, 180, 1);
+  sprite.setTextColor(sprite.color565(60,60,60));
+  sprite.drawString("UP/DOWN   START", SCREEN_CX, 205, 1);  // indiciu de control
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// ECRAN EROARE INIT - afisat daca un periferic esential lipseste
+// =====================================================
+void drawInitErrorScreen(bool okDisplay, bool okAccel, bool okSD, bool okI2S, bool okMutex) {
+  if (!okDisplay) {
+    // Daca tocmai ecranul a esuat, nu avem unde desena -> raportam doar pe Serial
+    Serial.println("=== INIT ERROR ===");
+    Serial.printf("DISPLAY : %s\n", okDisplay ? "OK" : "FAIL");
+    Serial.printf("ACCEL   : %s\n", okAccel   ? "OK" : "FAIL");
+    Serial.printf("SD CARD : %s\n", okSD      ? "OK" : "FAIL");
+    Serial.printf("I2S MIC : %s\n", okI2S     ? "OK" : "FAIL");
+    Serial.printf("MUTEX   : %s\n", okMutex   ? "OK" : "FAIL");
+    return;
+  }
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_RED);
+  sprite.drawString("INIT ERROR", SCREEN_CX, 28, 2);
+  sprite.drawFastHLine(35, 42, 170, sprite.color565(60, 0, 0));
+
+  // Tabel cu starea fiecarui periferic
+  struct { const char* name; bool ok; } components[5] = {
+    {"DISPLAY", okDisplay}, {"ACCEL", okAccel}, {"SD CARD", okSD},
+    {"I2S MIC", okI2S},     {"MUTEX",  okMutex}
+  };
+  const int startY = 62, stepY = 26;
+  for (int i = 0; i < 5; i++) {
+    int yC = startY + i * stepY;
+    bool ok = components[i].ok;
+    if (!ok) sprite.fillRoundRect(32, yC - 10, 176, 20, 4, sprite.color565(50, 0, 0)); // fundal rosu pe esec
+    sprite.setTextDatum(ML_DATUM);
+    sprite.setTextColor(ok ? sprite.color565(150,150,150) : TFT_WHITE);
+    sprite.drawString(components[i].name, 40, yC, 2);
+    sprite.setTextDatum(MR_DATUM);
+    sprite.setTextColor(ok ? TFT_GREEN : TFT_RED);
+    sprite.drawString(ok ? "OK" : "FAIL", 200, yC, 2);
+  }
+  sprite.setTextDatum(MC_DATUM);
+  sprite.drawFastHLine(35, 198, 170, sprite.color565(40,40,40));
+  sprite.setTextColor(sprite.color565(80,80,80));
+  sprite.drawString("CHECK WIRING", SCREEN_CX, 212, 1);
+  drawCircularClipBorder(sprite.color565(60,0,0));
+  sprite.pushSprite(0, 0);
+
+  Serial.println("=== INIT ERROR ===");
+  for (int i = 0; i < 5; i++)
+    Serial.printf("%-10s: %s\n", components[i].name, components[i].ok ? "OK" : "FAIL");
+}
+
+// =====================================================
+// LOOP MAIN - bucla principala, ruleaza pe core 1
+// Trateaza interfata si masina de stari; sarcinile grele (FFT) sunt pe core 0.
+// =====================================================
+void loop() {
+  updateRtcCache();             // reimprospateaza ora periodic
+  updateWifiLed();              // gestioneaza LED-ul de status WiFi
+  updateStatusLed();            // LED de stare masina (doar in monitoring)
+  if (wifiStarted) webServer.handleClient();   // serveste cererile web
+
+  // ---- MAIN MENU ----
+  if (state == MAIN_MENU) {
+    // PWR scurt = navigheaza inapoi prin meniul circular
+    if (clickShort(pwrBtn, NAV_LONG_MS)) {
+      if (--logicalMenuPosition < 0) { logicalMenuPosition += MENU_COUNT; currentAngle += 360.0f; }
+      selectedOption = (MenuOption)logicalMenuPosition;
+    }
+    // NAV scurt (fizic sau web) = navigheaza inainte
+    if (navShort()) {
+      if (++logicalMenuPosition >= MENU_COUNT) { logicalMenuPosition -= MENU_COUNT; currentAngle -= 360.0f; }
+      selectedOption = (MenuOption)logicalMenuPosition;
+    }
+    // NAV lung (fizic sau web) = intra in optiunea selectata
+    if (navLong()) {
+      if (selectedOption == MENU_TEST) {
+        playMenuTransitionOut();
+        clearBuffers();
+        if (machineCount > 0) {
+          machineSelCursor = selectedMachine;
+          state = SELECT_MACHINE;   // alege utilajul intai
+        } else {
+          // niciun utilaj definit -> mergem direct, nume generic
+          prepareNextLogFile();
+          state = WAIT_AMBIENT;
+        }
+      } else if (selectedOption == MENU_VIEW_DATA) {
+        scanLogFiles();
+        if (logFileCount == 0) {
+          drawCenteredMessage("NICIUN FISIER", "CARDUL E GOL", TFT_RED);
+          vTaskDelay(pdMS_TO_TICKS(1500));
+        } else {
+          playMenuTransitionOut();
+          browserCursor = logFileCount - 1;  // pornim de la cel mai recent
+          browserScroll = max(0, browserCursor - FILES_PER_PAGE + 1);
+          state = FILE_BROWSER;
+        }
+      } else if (selectedOption == MENU_SETTINGS) {
+        playMenuTransitionOut();
+        settingsCursor = SET_ITEM_SAMPLING;
+        state = SETTINGS_VIEW;
+      } else if (selectedOption == MENU_SHUTDOWN) {
+        doShutdown();             // oprire completa
+      }
+    }
+    updateButton(pwrBtn);         // mentine starea butonului actualizata
+    if (state == MAIN_MENU) drawMainMenu();
+  }
+
+  // ---- SETTINGS VIEW ----
+  else if (state == SETTINGS_VIEW) {
+    // PWR lung = inapoi la meniu
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) { playMenuTransitionIn(false); state = MAIN_MENU; }
+    // PWR scurt = schimba valoarea optiunii curente
+    if (clickShort(pwrBtn, PWR_LONG_BACK_MS)) {
+      if (settingsCursor == SET_ITEM_SAMPLING) {
+        currentSamplingIndex = (currentSamplingIndex + 1) % 4;  // cicleaza duratele
+      } else if (settingsCursor == SET_ITEM_WIFI) {
+        wifiEnabled = !wifiEnabled;            // comuta WiFi
+        if (wifiEnabled) wifiStart();
+        else             wifiStop();
+      }
+    }
+    // NAV scurt = muta cursorul intre optiuni
+    if (clickShort(navBtn, NAV_LONG_MS)) {
+      settingsCursor = (settingsCursor + 1) % SET_ITEM_COUNT;
+    }
+    // NAV lung = actiune (enter pe optiunea curenta)
+    if (clickLong(navBtn, NAV_LONG_MS)) {
+      if (settingsCursor == SET_ITEM_TIME) {
+        if (rtcAvailable) {
+          // pre-incarcam valorile curente in campurile de editare
+          setTimeVals[SET_HOUR]  = rtcCache.hour;
+          setTimeVals[SET_MIN]   = rtcCache.min;
+          setTimeVals[SET_SEC]   = 0;
+          setTimeVals[SET_DAY]   = rtcCache.day;
+          setTimeVals[SET_MONTH] = rtcCache.month;
+          setTimeVals[SET_YEAR]  = rtcCache.year;
+          setTimeField = SET_HOUR;
+          state = SETTINGS_SET_TIME;
+        } else {
+          drawCenteredMessage("RTC", "INDISPONIBIL", TFT_RED);
+          vTaskDelay(pdMS_TO_TICKS(1200));
+        }
+      } else if (settingsCursor == SET_ITEM_WIFI) {
+        wifiEnabled = !wifiEnabled;
+        if (wifiEnabled) wifiStart();
+        else             wifiStop();
+      } else if (settingsCursor == SET_ITEM_SAMPLING) {
+        currentSamplingIndex = (currentSamplingIndex + 1) % 4;
+      }
+    }
+    updateButton(navBtn);
+    updateButton(pwrBtn);
+    if (state == SETTINGS_VIEW) drawSettingsView();
+  }
+
+  // ---- SETARE DATA/ORA ----
+  else if (state == SETTINGS_SET_TIME) {
+    // PWR scurt = incrementeaza campul curent (cu rollover specific fiecaruia)
+    if (clickShort(pwrBtn, PWR_LONG_BACK_MS)) {
+      switch (setTimeField) {
+        case SET_HOUR:  setTimeVals[SET_HOUR]  = (setTimeVals[SET_HOUR]  + 1) % 24; break;
+        case SET_MIN:   setTimeVals[SET_MIN]   = (setTimeVals[SET_MIN]   + 1) % 60; break;
+        case SET_SEC:   setTimeVals[SET_SEC]   = (setTimeVals[SET_SEC]   + 1) % 60; break;
+        case SET_DAY:   setTimeVals[SET_DAY]   = (setTimeVals[SET_DAY]  >= 31) ? 1 : setTimeVals[SET_DAY]   + 1; break;
+        case SET_MONTH: setTimeVals[SET_MONTH] = (setTimeVals[SET_MONTH]>= 12) ? 1 : setTimeVals[SET_MONTH] + 1; break;
+        case SET_YEAR:  setTimeVals[SET_YEAR]  = (setTimeVals[SET_YEAR]  + 1) % 100; break;
+      }
+    }
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) state = SETTINGS_VIEW;  // PWR lung = renunta
+    if (clickShort(navBtn, NAV_LONG_MS))     setTimeField = (setTimeField + 1) % SET_FIELD_COUNT; // NAV scurt = camp urmator
+    // NAV lung = salveaza ora in RTC
+    if (clickLong(navBtn, NAV_LONG_MS)) {
+      RtcTime newTime = { setTimeVals[SET_SEC], setTimeVals[SET_MIN], setTimeVals[SET_HOUR],
+                          setTimeVals[SET_DAY], setTimeVals[SET_MONTH], setTimeVals[SET_YEAR] };
+      if (rtcWrite(newTime)) { rtcCache = newTime; drawCenteredMessage("SALVAT!", "ORA SETATA", TFT_GREEN); }
+      else                     drawCenteredMessage("EROARE", "SCRIERE RTC", TFT_RED);
+      vTaskDelay(pdMS_TO_TICKS(900));
+      state = SETTINGS_VIEW;
+    }
+    updateButton(navBtn);
+    updateButton(pwrBtn);
+    if (state == SETTINGS_SET_TIME) drawSetTimeView();
+  }
+
+  // ---- SELECTIE UTILAJ (inainte de test) ----
+  else if (state == SELECT_MACHINE) {
+    // PWR lung = inapoi la meniu
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) { playMenuTransitionIn(false); state = MAIN_MENU; return; }
+    // NAV scurt (fizic sau web) = utilajul urmator
+    if (navShort()) {
+      machineSelCursor = (machineSelCursor + 1) % machineCount;
+    }
+    // PWR scurt = utilajul anterior
+    if (clickShort(pwrBtn, PWR_LONG_BACK_MS)) {
+      machineSelCursor = (machineSelCursor - 1 + machineCount) % machineCount;
+    }
+    // NAV lung (fizic sau web) = confirma utilajul si porneste testul
+    if (navLong()) {
+      selectedMachine = machineSelCursor;
+      buildLogFileName();    // construieste numele cu utilaj + data + ora
+      state = WAIT_AMBIENT;
+    }
+    updateButton(pwrBtn);
+    if (state == SELECT_MACHINE) drawSelectMachine();
+  }
+
+  // ---- FILE BROWSER ----
+  else if (state == FILE_BROWSER) {
+    // PWR scurt = fisierul anterior (urca in lista)
+    if (clickShort(pwrBtn, PWR_LONG_BACK_MS)) {
+      if (browserCursor > 0) { browserCursor--; if (browserCursor < browserScroll) browserScroll = browserCursor; }
+    }
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) { playMenuTransitionIn(false); state = MAIN_MENU; } // PWR lung = meniu
+    // NAV scurt = fisierul urmator (coboara in lista)
+    if (clickShort(navBtn, NAV_LONG_MS)) {
+      if (browserCursor < logFileCount - 1) {
+        browserCursor++;
+        if (browserCursor >= browserScroll + FILES_PER_PAGE) browserScroll = browserCursor - FILES_PER_PAGE + 1;
+      }
+    }
+    // NAV lung = deschide graficul fisierului selectat
+    if (clickLong(navBtn, NAV_LONG_MS)) {
+      plotCursor = browserCursor;
+      strncpy(currentLogFile, logFileList[plotCursor], sizeof(currentLogFile));
+      state = PLOT_VIEW;
+      drawPlotFromSD(currentLogFile);
+    }
+    if (state == FILE_BROWSER) drawFileBrowser();
+  }
+
+  // ---- WAIT AMBIENT (Step 1: calibrare zgomot de fond) ----
+  else if (state == WAIT_AMBIENT) {
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) { playMenuTransitionIn(false); state = MAIN_MENU; return; }
+    // ecran de instructiune
+    sprite.fillSprite(BG_COLOR);
+    sprite.setTextColor(TFT_WHITE);
+    sprite.drawString("STEP 1", SCREEN_CX, 60, 4);
+    sprite.drawString("HALL CALIBRATION", SCREEN_CX, 90, 2);
+    sprite.fillCircle(SCREEN_CX, 155, 30, TFT_CYAN);
+    sprite.setTextColor(TFT_BLACK);
+    sprite.drawString("PRESS", SCREEN_CX, 150, 2);
+    sprite.setTextColor(TFT_DARKGREY);
+    sprite.drawString("AUTO ORIENTATION", SCREEN_CX, 215, 2);
+    drawCircularClipBorder(sprite.color565(25,25,25));
+    sprite.pushSprite(0, 0);
+    // NAV scurt (fizic sau web) = porneste calibrarea ambient (invata si orientarea)
+    if (navShort()) {
+      drawCenteredMessage("STEP 1", "HALL CALIBRATION", TFT_CYAN);
+      if (runCalibration(ambientFFT, true, false)) state = WAIT_MACHINE;
+      else { drawCenteredMessage("ERROR", "NO SENSOR DATA", TFT_RED); vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+  }
+
+  // ---- WAIT MACHINE (Step 2: invata semnatura masinii sanatoase) ----
+  else if (state == WAIT_MACHINE) {
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) { playMenuTransitionIn(false); clearBuffers(); state = MAIN_MENU; return; }
+    sprite.fillSprite(BG_COLOR);
+    sprite.setTextColor(TFT_WHITE);
+    sprite.drawString("STEP 2", SCREEN_CX, 60, 4);
+    sprite.drawString("ENGINE ANALYSIS", SCREEN_CX, 90, 2);
+    sprite.fillCircle(SCREEN_CX, 155, 30, TFT_CYAN);
+    sprite.setTextColor(TFT_BLACK);
+    sprite.drawString("PRESS", SCREEN_CX, 150, 2);
+    sprite.setTextColor(TFT_CYAN);
+    sprite.drawString(mountModeToString(currentMode), SCREEN_CX, 215, 2);  // orientarea detectata
+    drawCircularClipBorder(sprite.color565(25,25,25));
+    sprite.pushSprite(0, 0);
+    // NAV scurt (fizic sau web) = porneste calibrarea masinii
+    if (navShort()) {
+      drawCenteredMessage("STEP 2", "ENGINE ANALYSIS", TFT_CYAN);
+      if (runCalibration(machineFFT, false, true)) {
+        // scadem zgomotul ambiant din semnatura masinii (cu marja AMBIENT_MULTIPLIER)
+        for (int i = 0; i < FFT_BINS; i++) {
+          double clean = machineFFT[i] - (ambientFFT[i] * AMBIENT_MULTIPLIER);
+          machineFFT[i] = (clean < 0.0) ? 0.0 : clean;
+        }
+        learnedPower  = computeCleanPower(machineFFT, 2, FFT_BINS, FFT_NOISE_GATE); // puterea de referinta
+        healthScore   = 100.0f; anomalyScore = 0.0f; smoothVib = 0.0f; vibAlertLevel = 0.0f; // resetam scorurile
+        memset(smoothedFFT, 0, sizeof(smoothedFFT));
+        state = MONITORING;
+      } else { drawCenteredMessage("ERROR", "NO SENSOR DATA", TFT_RED); vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+  }
+
+  // ---- MONITORING (rularea propriu-zisa) ----
+  else if (state == MONITORING) {
+    // PWR lung = iesire la meniu; reaprindem backlight si stingem LED-ul de stare
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) { playMenuTransitionIn(false); clearBuffers(); backlightOn = true; digitalWrite(DISPLAY_PWR_PIN, LOW); digitalWrite(STATUS_LED_PIN, LOW); statusLedState = false; state = MAIN_MENU; return; }
+    // PWR scurt = stinge/aprinde backlight-ul (monitorizarea continua in fundal)
+    if (clickShort(pwrBtn, PWR_LONG_BACK_MS)) {
+      backlightOn = !backlightOn;
+      // pin 4 controleaza backlight: LOW = aprins (cum e folosit in cod), HIGH = stins
+      digitalWrite(DISPLAY_PWR_PIN, backlightOn ? LOW : HIGH);
+    }
+    double    currentRaw[FFT_BINS];
+    AccelData e;
+    // luam un snapshot al datelor de la senzori si actualizam monitorizarea
+    if (getSharedSnapshot(currentRaw, &e)) updateMonitoring(currentRaw, e);
+    else drawCenteredMessage("WAITING...", "SENSOR DATA", TFT_YELLOW);
+    updateButton(pwrBtn);
+    // NAV scurt = sare la graficul ultimului fisier logat
+    if (clickShort(navBtn, NAV_LONG_MS)) {
+      scanLogFiles();
+      plotCursor = logFileCount - 1;
+      if (plotCursor >= 0) {
+        strncpy(currentLogFile, logFileList[plotCursor], sizeof(currentLogFile));
+        state = PLOT_VIEW;
+        drawPlotFromSD(currentLogFile);
+      }
+    }
+  }
+
+  // ---- PLOT VIEW (vizualizare grafic health dintr-un fisier) ----
+  else if (state == PLOT_VIEW) {
+    bool needRedraw = false;
+    // PWR scurt = fisierul anterior
+    if (clickShort(pwrBtn, PWR_LONG_BACK_MS)) {
+      if (plotCursor > 0) { plotCursor--; strncpy(currentLogFile, logFileList[plotCursor], sizeof(currentLogFile)); needRedraw = true; }
+    }
+    // PWR lung = inapoi la browserul de fisiere
+    if (clickLong(pwrBtn, PWR_LONG_BACK_MS)) {
+      browserCursor = plotCursor;
+      browserScroll = max(0, browserCursor - FILES_PER_PAGE + 1);
+      state = FILE_BROWSER;
+    }
+    // NAV scurt = fisierul urmator; daca era ultimul, iesim la meniu
+    if (clickShort(navBtn, NAV_LONG_MS)) {
+      if (plotCursor < logFileCount - 1) {
+        plotCursor++;
+        strncpy(currentLogFile, logFileList[plotCursor], sizeof(currentLogFile));
+        needRedraw = true;
+      } else { playMenuTransitionIn(false); state = MAIN_MENU; }
+    }
+    updateButton(navBtn);
+    if (needRedraw && state == PLOT_VIEW) drawPlotFromSD(currentLogFile); // redesenam doar la schimbare
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(16));  // ~60 cadre/s; cedeaza CPU ca sa nu infometam watchdog-ul
+}
+
+// =====================================================
+// UTILITARE ECRAN ROTUND
+// =====================================================
+// Deseneaza marginea circulara (masca ecranul rotund)
+void drawCircularClipBorder(uint16_t color) {
+  sprite.drawSmoothCircle(SCREEN_CX, SCREEN_CY, SCREEN_R - 1, color, BG_COLOR);
+}
+// Verifica daca un punct (x,y) e in interiorul unui cerc (folosit la decuparea graficului)
+bool isInsideCircle(int x, int y, int cx, int cy, int r) {
+  int dx = x - cx, dy = y - cy;
+  return (dx*dx + dy*dy) <= (r*r);   // comparam distanta la patrat (evitam radacina)
+}
+
+// =====================================================
+// ANIMATIE ARCURI - cele 4 arcuri colorate rotitoare din tranzitii
+// =====================================================
+void drawFadingSpinningArcs(float spinAngle, float fadeFactor) {
+  int val = (int)(255.0f * fadeFactor);              // intensitate dupa factorul de fade
+  uint16_t colors[4] = {
+    sprite.color565(0, val, val), sprite.color565(0, val, 0),
+    sprite.color565(val, val, 0), sprite.color565(val, 0, 0)
+  };
+  int r_out = 108, thickness = max(1, (int)(10.0f * fadeFactor)), r_in = r_out - thickness, width = 70;
+  for (int i = 0; i < 4; i++) {
+    float centerPos = (i * 90.0f) - spinAngle + 3600.0f + TOP_OFFSET; // pozitia fiecarui arc
+    int safeStart = ((int)(centerPos - width / 2.0f) % 360 + 360) % 360; // normalizat 0..359
+    int safeEnd   = ((int)(centerPos + width / 2.0f) % 360 + 360) % 360;
+    if (safeEnd < safeStart) {
+      // arcul trece peste 0 -> il desenam in doua bucati
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, r_out, r_in, safeStart, 360,     colors[i], BG_COLOR);
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, r_out, r_in, 0,         safeEnd, colors[i], BG_COLOR);
+    } else {
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, r_out, r_in, safeStart, safeEnd, colors[i], BG_COLOR);
+    }
+  }
+}
+
+// =====================================================
+// TRANZITII - animatii intre ecrane
+// =====================================================
+// Animatie de intrare (arcuri care apar, optional logo "MENTPREV")
+void playMenuTransitionIn(bool showHello) {
+  unsigned long start = millis(), duration = 1200;
+  float targetSpin = currentAngle;
+  while (millis() - start < duration) {
+    sprite.fillSprite(BG_COLOR);
+    float t = constrain((float)(millis() - start) / duration, 0.0f, 1.0f); // progres 0..1
+    float inv = 1.0f - t, easeOut = 1.0f - (inv * inv * inv);               // curba de incetinire
+    drawFadingSpinningArcs(targetSpin + 720.0f * (1.0f - easeOut), t);
+    if (showHello) {
+      int val = (int)(255.0f * t);
+      sprite.setTextColor(sprite.color565(val, val, val));
+      sprite.drawString("MENTPREV", SCREEN_CX, SCREEN_CY, 4);
+    }
+    drawCircularClipBorder(sprite.color565(20,20,20));
+    sprite.pushSprite(0, 0);
+    delay(16);
+  }
+}
+
+// Animatie de iesire (arcuri care se rotesc si dispar)
+void playMenuTransitionOut() {
+  unsigned long start = millis(), duration = 800;
+  float startSpin = currentAngle;
+  while (millis() - start < duration) {
+    sprite.fillSprite(BG_COLOR);
+    float t = constrain((float)(millis() - start) / duration, 0.0f, 1.0f);
+    drawFadingSpinningArcs(startSpin - (720.0f * t * t * t), 1.0f - t);
+    drawCircularClipBorder(sprite.color565(20,20,20));
+    sprite.pushSprite(0, 0);
+    delay(16);
+  }
+}
+
+// Oprire completa a dispozitivului (animatie "BYE!", apoi taie alimentarea prin latch)
+void doShutdown() {
+  if (wifiStarted) wifiStop();                       // oprim WiFi curat
+  unsigned long start = millis(), duration = 1600;
+  float startSpin = currentAngle;
+  while (millis() - start < duration) {
+    sprite.fillSprite(BG_COLOR);
+    float t = constrain((float)(millis() - start) / duration, 0.0f, 1.0f);
+    float fade = 1.0f - t;
+    drawFadingSpinningArcs(startSpin - (1080.0f * t * t * t), fade);
+    sprite.setTextColor(sprite.color565((int)(255*fade), (int)(255*fade), (int)(255*fade)));
+    sprite.drawString("BYE!", SCREEN_CX, SCREEN_CY, 4);
+    drawCircularClipBorder(sprite.color565(20,20,20));
+    sprite.pushSprite(0, 0);
+    delay(16);
+  }
+  sprite.fillSprite(BG_COLOR);
+  sprite.pushSprite(0, 0);
+  digitalWrite(WIFI_LED_PIN, LOW);                   // stingem LED-urile
+  digitalWrite(STATUS_LED_PIN, LOW);
+  digitalWrite(DISPLAY_PWR_PIN, HIGH);               // stingem ecranul
+  delay(10);
+  digitalWrite(PWR_HOLD_PIN, LOW);                   // taiem alimentarea (latch off)
+  while (1);                                         // nu ar trebui sa ajunga aici
+}
+
+// =====================================================
+// SCAN FISIERE - listeaza toate fisierele .csv din radacina SD
+// =====================================================
+void scanLogFiles() {
+  logFileCount = 0;
+  File root = SD.open("/");
+  if (!root) return;
+  File entry;
+  while ((entry = root.openNextFile()) && logFileCount < MAX_LOG_FILES) {
+    if (!entry.isDirectory()) {
+      const char* fn = entry.name();
+      // pastram doar fisierele .csv (excludem utilaje.txt etc.)
+      int len = strlen(fn);
+      bool isCsv = (len > 4) &&
+                   (strcasecmp(fn + len - 4, ".csv") == 0);
+      if (isCsv) {
+        // unele versiuni de SD lib intorc numele fara '/', altele cu.
+        // normalizam: stocam cu '/' in fata.
+        if (fn[0] == '/') {
+          strncpy(logFileList[logFileCount], fn, 47);
+        } else {
+          logFileList[logFileCount][0] = '/';
+          strncpy(logFileList[logFileCount] + 1, fn, 46);
+        }
+        logFileList[logFileCount][47] = '\0';        // garantam terminarea sirului
+        logFileCount++;
+      }
+    }
+    entry.close();
+  }
+  root.close();
+}
+
+// =====================================================
+// FILE BROWSER UI - lista fisierelor de pe SD
+// =====================================================
+void drawFileBrowser() {
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString("LOG FILES", SCREEN_CX, 28, 2);
+  sprite.drawFastHLine(40, 42, 160, TFT_DARKGREY);
+  // sageti de derulare daca exista fisiere deasupra/dedesubt
+  if (browserScroll > 0)
+    sprite.fillTriangle(SCREEN_CX, 48, SCREEN_CX-6, 56, SCREEN_CX+6, 56, TFT_DARKGREY);
+  if (browserScroll + FILES_PER_PAGE < logFileCount)
+    sprite.fillTriangle(SCREEN_CX, 202, SCREEN_CX-6, 194, SCREEN_CX+6, 194, TFT_DARKGREY);
+  const int rowY[FILES_PER_PAGE] = {66, 91, 116, 141, 166};  // pozitiile verticale ale randurilor
+  for (int i = 0; i < FILES_PER_PAGE; i++) {
+    int idx = browserScroll + i;
+    if (idx >= logFileCount) break;
+    int yC = rowY[i];
+    bool isSel = (idx == browserCursor);
+    // fara chenar: selectia se vede doar prin culoarea verde a textului
+    sprite.setTextColor(isSel ? TFT_GREEN : TFT_LIGHTGREY);
+    sprite.drawString(logFileList[idx] + 1, SCREEN_CX, yC - 2, 2);  // +1 sare peste '/'
+  }
+  sprite.drawFastHLine(40, 176, 160, TFT_DARKGREY);
+  char posBuf[24]; sprintf(posBuf, "%d / %d", browserCursor+1, logFileCount);
+  sprite.setTextColor(TFT_DARKGREY);
+  sprite.drawString(posBuf, SCREEN_CX, 188, 1);
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// SETTINGS VIEW - ecranul de setari cu trei optiuni (sampling, WiFi, RTC)
+// =====================================================
+void drawSettingsView() {
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString("SETTINGS", SCREEN_CX, 24, 2);
+  sprite.drawFastHLine(40, 36, 160, TFT_DARKGREY);
+
+  // --- 1. SAMPLING TIME --- (evidentiat daca e selectat)
+  bool selSampling = (settingsCursor == SET_ITEM_SAMPLING);
+  if (selSampling) {
+    sprite.fillRoundRect(40, 48, 160, 38, 6, sprite.color565(25,25,0));
+    sprite.drawRoundRect(40, 48, 160, 38, 6, TFT_YELLOW);
+  }
+  sprite.setTextColor(selSampling ? TFT_YELLOW : sprite.color565(100,100,100));
+  sprite.drawString("SAMPLING", SCREEN_CX, 58, 1);
+  sprite.setTextColor(selSampling ? TFT_YELLOW : sprite.color565(120,120,120));
+  sprite.drawString(SAMPLING_LABELS[currentSamplingIndex], SCREEN_CX, 74, 2);
+
+  // --- 2. WIFI --- (culoarea reflecta starea: gri=oprit, cyan=activ, verde=client conectat)
+  bool selWifi = (settingsCursor == SET_ITEM_WIFI);
+  uint16_t wifiColor = wifiEnabled
+    ? (wifiClients > 0 ? TFT_GREEN : TFT_CYAN)
+    : sprite.color565(90,90,90);
+  if (selWifi) {
+    sprite.fillRoundRect(40, 92, 160, 38, 6, sprite.color565(0,20,30));
+    sprite.drawRoundRect(40, 92, 160, 38, 6, TFT_CYAN);
+  }
+  sprite.setTextColor(selWifi ? TFT_CYAN : sprite.color565(100,100,100));
+  sprite.drawString("WIFI", SCREEN_CX, 102, 1);
+  const char* wifiLabel = !wifiEnabled ? "OFF"
+                        : (wifiClients > 0 ? "CONECTAT" : "AP ACTIV");
+  sprite.setTextColor(wifiColor);
+  sprite.drawString(wifiLabel, SCREEN_CX, 118, 2);
+
+  // --- 3. RTC / SET TIME --- (afiseaza ora curenta sau N/A)
+  bool selTime = (settingsCursor == SET_ITEM_TIME);
+  if (selTime) {
+    sprite.fillRoundRect(40, 136, 160, 46, 6, sprite.color565(0,25,25));
+    sprite.drawRoundRect(40, 136, 160, 46, 6, sprite.color565(0,200,255));
+  }
+  if (rtcAvailable) {
+    char timeBuf[12]; sprintf(timeBuf, "%02d:%02d", rtcCache.hour, rtcCache.min);
+    sprite.setTextColor(selTime ? sprite.color565(0,200,255) : sprite.color565(100,100,100));
+    sprite.drawString("RTC", SCREEN_CX, 146, 1);
+    sprite.setTextColor(selTime ? sprite.color565(0,200,255) : sprite.color565(0,150,200));
+    sprite.drawString(timeBuf, SCREEN_CX, 164, 2);
+  } else {
+    sprite.setTextColor(sprite.color565(80,80,80));
+    sprite.drawString("RTC: N/A", SCREEN_CX, 158, 2);
+  }
+
+  // hint jos cu comenzile disponibile
+  sprite.drawFastHLine(40, 192, 160, TFT_DARKGREY);
+  sprite.setTextColor(sprite.color565(70,70,70));
+  sprite.drawString("CHANGE  NEXT", SCREEN_CX, 202, 1);
+  sprite.setTextColor(sprite.color565(55,55,55));
+  
+
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// SET TIME VIEW - editorul de data/ora (campuri HH MM SS / ZZ LL AA)
+// =====================================================
+void drawSetTimeView() {
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString("SET TIME", SCREEN_CX, 22, 2);
+  sprite.drawFastHLine(40, 34, 160, sprite.color565(40,40,40));
+
+  const int TIME_Y = 88, DATE_Y = 158;        // randul orei si randul datei
+  const int XS[3]  = {54, 120, 186};          // pozitiile X ale celor 3 campuri
+
+  // functie locala care deseneaza un camp (evidentiat daca e cel curent)
+  auto drawField = [&](int fi, int x, int y, uint16_t activeColor) {
+    bool cur = (setTimeField == fi);
+    uint16_t boxC = cur ? activeColor : sprite.color565(30,30,30);
+    uint16_t txtC = cur ? TFT_BLACK : sprite.color565(180,180,180);
+    if (cur) sprite.fillRoundRect(x-20, y-18, 40, 36, 6, boxC);
+    else      sprite.drawRoundRect(x-20, y-18, 40, 36, 6, boxC);
+    char vBuf[4]; sprintf(vBuf, "%02d", setTimeVals[fi]);
+    sprite.setTextColor(txtC);
+    sprite.drawString(vBuf, x, y, 4);
+  };
+
+  // randul orei: HH : MM : SS
+  for (int i = 0; i < 3; i++) {
+    drawField(i, XS[i], TIME_Y, sprite.color565(0,200,255));
+    if (i < 2) { sprite.setTextColor(sprite.color565(60,60,60)); sprite.drawString(":", XS[i]+33, TIME_Y-2, 4); }
+  }
+  sprite.setTextColor(sprite.color565(45,45,45));
+  sprite.drawString("HH    MM    SS", SCREEN_CX, TIME_Y+22, 1);
+  sprite.drawFastHLine(55, 120, 110, sprite.color565(25,25,25));
+
+  // randul datei: ZZ / LL / AA
+  for (int i = 0; i < 3; i++) {
+    drawField(SET_DAY + i, XS[i], DATE_Y, sprite.color565(255,180,0));
+    if (i < 2) { sprite.setTextColor(sprite.color565(60,60,60)); sprite.drawString("/", XS[i]+33, DATE_Y-2, 4); }
+  }
+  sprite.setTextColor(sprite.color565(45,45,45));
+  sprite.drawString("ZZ    LL    AA", SCREEN_CX, DATE_Y+22, 1);
+  sprite.drawFastHLine(40, 196, 160, sprite.color565(25,25,25));
+  sprite.setTextColor(sprite.color565(50,50,50));
+  sprite.drawString("D18:+1  D13:Next/Save", SCREEN_CX, 210, 1);   // indiciu de control
+  char idxBuf[12]; sprintf(idxBuf, "%d / %d", setTimeField+1, (int)SET_FIELD_COUNT);
+  sprite.setTextColor(sprite.color565(40,40,40));
+  sprite.drawString(idxBuf, SCREEN_CX, 224, 1);
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// MENIU PRINCIPAL - cele 4 optiuni dispuse circular, cu animatie de rotatie
+// =====================================================
+void drawMainMenu() {
+  const char*    labels[MENU_COUNT] = {"TEST", "VIEW DATA", "SETTINGS", "SHUTDOWN"};
+  const char*    subs[MENU_COUNT]   = {"SESIUNE NOUA", "GRAFIC SD", "TIMP CALIBRARE", "OPRIRE"}; // nefolosite (inlocuite de ora)
+  const uint16_t colors[MENU_COUNT] = {TFT_CYAN, TFT_GREEN, TFT_YELLOW, TFT_RED};
+
+  sprite.fillSprite(BG_COLOR);
+
+  // animatie lina spre unghiul tinta al optiunii selectate
+  float targetAngle = logicalMenuPosition * 90.0f;
+  float diff = targetAngle - currentAngle;
+  if (fabs(diff) > 0.1f)
+    currentAngle += (fabs(diff) <= ROTATION_SPEED) ? diff : ((diff > 0) ? ROTATION_SPEED : -ROTATION_SPEED);
+
+  // deseneaza cele 4 arcuri colorate ale optiunilor
+  for (int i = 0; i < MENU_COUNT; i++) {
+    float centerPos = (i * 90.0f) - currentAngle + 3600.0f + TOP_OFFSET;
+    int safeStart = ((int)(centerPos - 35.0f) % 360 + 360) % 360;
+    int safeEnd   = ((int)(centerPos + 35.0f) % 360 + 360) % 360;
+    if (safeEnd < safeStart) {
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 108, 98, safeStart, 360,     colors[i], BG_COLOR);
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 108, 98, 0,         safeEnd, colors[i], BG_COLOR);
+    } else {
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 108, 98, safeStart, safeEnd, colors[i], BG_COLOR);
+    }
+  }
+
+  int sel = (int)selectedOption;
+  uint16_t selColor = colors[sel];
+  sprite.fillTriangle(SCREEN_CX, 35, SCREEN_CX-6, 43, SCREEN_CX+6, 43, selColor); // indicator sus
+  sprite.setTextColor(selColor);
+  sprite.drawString(labels[sel], SCREEN_CX, 145, 4);  // numele optiunii selectate
+  // sub numele submeniului afisam permanent ora (in loc de subtitlu)
+  if (rtcAvailable) {
+    char subTime[9]; sprintf(subTime, "%02d:%02d", rtcCache.hour, rtcCache.min);
+    sprite.setTextColor(sprite.color565(150,150,150));
+    sprite.drawString(subTime, SCREEN_CX, 175, 2);
+  }
+
+  // pictograma centrala diferita pentru fiecare optiune
+  int iconY = 90;
+  if (sel == MENU_TEST) {
+    // unda (semnal) pentru TEST
+    int pts[][2] = {{-28,0},{-14,0},{-6,-18},{6,18},{14,0},{28,0}};
+    for (int i = 0; i < 5; i++)
+      sprite.drawWideLine(SCREEN_CX+pts[i][0], iconY+pts[i][1], SCREEN_CX+pts[i+1][0], iconY+pts[i+1][1], 3, selColor);
+  } else if (sel == MENU_VIEW_DATA) {
+    // bare de grafic pentru VIEW DATA
+    sprite.fillRect(SCREEN_CX-18, iconY-8,  6, 20, selColor);
+    sprite.fillRect(SCREEN_CX-4,  iconY-18, 6, 30, selColor);
+    sprite.fillRect(SCREEN_CX+10, iconY-2,  6, 14, selColor);
+    sprite.fillRect(SCREEN_CX-22, iconY+14, 40, 4, selColor);
+  } else if (sel == MENU_SETTINGS) {
+    // roata dintata stilizata pentru SETTINGS
+    sprite.drawSmoothCircle(SCREEN_CX, iconY, 16, selColor, BG_COLOR);
+    sprite.fillCircle(SCREEN_CX, iconY, 3, selColor);
+    sprite.drawWideLine(SCREEN_CX, iconY, SCREEN_CX, iconY-8, 2, selColor);
+    sprite.drawWideLine(SCREEN_CX, iconY, SCREEN_CX+6, iconY+6, 2, selColor);
+  } else if (sel == MENU_SHUTDOWN) {
+    // simbol de power pentru SHUTDOWN
+    sprite.drawSmoothArc(SCREEN_CX, iconY+2, 20, 16, 215, 360, selColor, BG_COLOR);
+    sprite.drawSmoothArc(SCREEN_CX, iconY+2, 20, 16, 0,   145, selColor, BG_COLOR);
+    sprite.fillRect(SCREEN_CX-2, iconY-18, 4, 18, selColor);
+  }
+
+  drawCircularClipBorder(sprite.color565(20,20,20));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// GRAFIC DIN SD - deseneaza evolutia HealthScore dintr-un fisier .csv
+// HealthScore e al 5-lea camp: idx,data,ora,ms,HEALTH,...
+// =====================================================
+void drawPlotFromSD(const char* filepath) {
+  // ecran de incarcare
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_YELLOW);
+  sprite.drawString("SE INCARCA...", SCREEN_CX, SCREEN_CY-10, 2);
+  sprite.setTextColor(TFT_DARKGREY);
+  sprite.drawString(filepath+1, SCREEN_CX, SCREEN_CY+12, 1);
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+
+  File file = SD.open(filepath, FILE_READ);
+  if (!file) {
+    // eroare de deschidere
+    sprite.fillSprite(BG_COLOR);
+    sprite.setTextColor(TFT_RED);
+    sprite.drawString("EROARE SD", SCREEN_CX, SCREEN_CY-10, 4);
+    sprite.setTextColor(TFT_DARKGREY);
+    sprite.drawString(filepath+1, SCREEN_CX, SCREEN_CY+14, 1);
+    drawCircularClipBorder(sprite.color565(25,25,25));
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  uint8_t plotData[240]; int dataCount = 0;          // pana la 240 de puncte de health
+  file.readStringUntil('\n');   // sare peste header
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    // extragem al 5-lea camp (HealthScore), adica dupa a 4-a virgula
+    int comma = -1;
+    int start = 0;
+    int field = 0;
+    int hVal = -1;
+    for (int searched = 0; searched < 5; searched++) {
+      comma = line.indexOf(',', start);
+      if (searched == 4) {
+        // campul HealthScore este intre 'start' si 'comma'
+        int endPos = (comma < 0) ? line.length() : comma;
+        hVal = line.substring(start, endPos).toInt();
+        break;
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+    if (hVal < 0) continue;                          // linie invalida -> sarim
+    int h = constrain(hVal, 0, 100);
+    if (dataCount < 240) plotData[dataCount++] = (uint8_t)h;
+    else { memmove(plotData, plotData+1, 239); plotData[239] = (uint8_t)h; } // buffer plin -> glisam
+    yield();                                         // cedeaza CPU (fisiere mari)
+  }
+  file.close();
+
+  sprite.fillSprite(BG_COLOR);
+  if (dataCount == 0) {
+    sprite.setTextColor(TFT_YELLOW);
+    sprite.drawString("FISIER GOL", SCREEN_CX, SCREEN_CY, 4);
+    drawCircularClipBorder(sprite.color565(25,25,25));
+    sprite.pushSprite(0, 0);
+    return;
+  }
+
+  // parametrii arcului pe care se deseneaza graficul (un sector circular)
+  const float ARC_START = 145.0f, ARC_END = 395.0f, ARC_SPAN = ARC_END - ARC_START;
+  const int   PLOT_INNER = 45, PLOT_OUTER = 100;     // raze: 0% spre exterior, 100% spre interior
+  const uint16_t gridColor = sprite.color565(30,30,30);
+
+  // cercuri de grila la 25/50/75/100%
+  for (int pct : {25, 50, 75, 100}) {
+    int r = map(pct, 0, 100, PLOT_OUTER, PLOT_INNER);
+    sprite.drawSmoothCircle(SCREEN_CX, SCREEN_CY, r, gridColor, BG_COLOR);
+  }
+  int r75 = map(75, 0, 100, PLOT_OUTER, PLOT_INNER);
+  sprite.drawSmoothCircle(SCREEN_CX, SCREEN_CY, r75, sprite.color565(40,60,20), BG_COLOR); // pragul 75% evidentiat
+
+  sprite.setTextColor(sprite.color565(60,60,60));
+  sprite.drawString("100", SCREEN_CX, SCREEN_CY - PLOT_INNER - 8, 1);
+  sprite.drawString("75",  SCREEN_CX, SCREEN_CY - r75 - 7, 1);
+  sprite.drawString("0",   SCREEN_CX, SCREEN_CY - PLOT_OUTER - 8, 1);
+
+  // traseaza curba health-ului punct cu punct, culoare dupa valoare
+  int pts = min(dataCount, 240);
+  float prevX = 0, prevY = 0; bool hasPrev = false;
+  for (int i = 0; i < pts; i++) {
+    float t   = (pts > 1) ? ((float)i / (pts-1)) : 0.0f;  // pozitie 0..1 pe arc
+    float deg = ARC_START + t * ARC_SPAN;
+    float rad = deg * DEG_TO_RAD;
+    int   h   = plotData[dataCount - pts + i];
+    float r   = (float)map(h, 0, 100, PLOT_OUTER, PLOT_INNER); // raza dupa health
+    float px  = SCREEN_CX + r * cosf(rad), py = SCREEN_CY + r * sinf(rad);
+    if (!isInsideCircle((int)px, (int)py, SCREEN_CX, SCREEN_CY, SCREEN_R-2)) { hasPrev = false; continue; }
+    uint16_t lc = (h > 75) ? TFT_GREEN : (h > 45) ? TFT_YELLOW : TFT_RED; // verde/galben/rosu
+    if (hasPrev && isInsideCircle((int)prevX, (int)prevY, SCREEN_CX, SCREEN_CY, SCREEN_R-2))
+      sprite.drawLine((int)prevX, (int)prevY, (int)px, (int)py, lc);     // segment intre puncte
+    if (i == pts-1) sprite.fillCircle((int)px, (int)py, 3, TFT_WHITE);   // marcam ultimul punct
+    prevX = px; prevY = py; hasPrev = true;
+  }
+
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString("HEALTH", SCREEN_CX, 18, 2);
+  sprite.setTextColor(TFT_DARKGREY);
+  sprite.drawString(filepath+1, SCREEN_CX, 32, 1);     // numele fisierului
+
+  // valoarea finala, mare, in centru
+  int lastH = plotData[dataCount-1];
+  uint16_t hc = (lastH > 75) ? TFT_GREEN : (lastH > 45) ? TFT_YELLOW : TFT_RED;
+  sprite.setTextColor(hc);
+  sprite.drawNumber(lastH, SCREEN_CX, SCREEN_CY-10, 6);
+  sprite.setTextColor(TFT_DARKGREY);
+  sprite.drawString("%", SCREEN_CX+28, SCREEN_CY+14, 2);
+
+  // statistici min/max pe tot fisierul
+  uint8_t minH = 100, maxH = 0;
+  for (int i = 0; i < dataCount; i++) { if (plotData[i] < minH) minH = plotData[i]; if (plotData[i] > maxH) maxH = plotData[i]; }
+  char statBuf[24]; sprintf(statBuf, "min:%d  max:%d", minH, maxH);
+  sprite.setTextColor(sprite.color565(60,60,60));
+  sprite.drawString(statBuf, SCREEN_CX, SCREEN_CY+36, 1);
+  char navBuf[24]; sprintf(navBuf, "%d / %d", plotCursor+1, logFileCount);  // pozitia in lista
+  sprite.setTextColor(sprite.color565(55,55,55));
+  sprite.drawString(navBuf, SCREEN_CX, 210, 1);
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// DSP TASK - microfon I2S + FFT (ruleaza continuu pe core 0)
+// Citeste esantioane audio, calculeaza spectrul si il publica partajat.
+// =====================================================
+void dspTask(void* pvParameters) {
+  size_t  bytesIn = 0;
+  int32_t sampleBuffer[SAMPLES];
+  for (;;) {
+    // citim un bloc de esantioane de la microfon (blocant pana sosesc date)
+    if (i2s_read(I2S_NUM_0, sampleBuffer, sizeof(sampleBuffer), &bytesIn, portMAX_DELAY) == ESP_OK) {
+      double mean = 0.0;
+      // convertim esantioanele si calculam media (componenta continua)
+      for (int i = 0; i < SAMPLES; i++) { vReal[i] = (double)(sampleBuffer[i] >> 14); vImag[i] = 0.0; mean += vReal[i]; }
+      mean /= SAMPLES;
+      for (int i = 0; i < SAMPLES; i++) vReal[i] -= mean;   // eliminam media (centram pe 0)
+      FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);      // fereastra Hamming (reduce scurgerile)
+      FFT.compute(FFT_FORWARD);                             // calculam FFT
+      FFT.complexToMagnitude();                             // convertim in magnitudine spectrala
+
+      AccelData localAccel;
+      // NU mai citim I2C aici - accelSamplingTask se ocupa de asta la rata fixa.
+      // Luam ultima valoare disponibila (evita conflict pe magistrala I2C).
+      localAccel.acceleration.x = lastAccX;
+      localAccel.acceleration.y = lastAccY;
+      localAccel.acceleration.z = lastAccZ;
+
+      // publicam spectrul si acceleratia in zona partajata (sub mutex)
+      if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+        memcpy(sharedFFT, vReal, sizeof(double) * FFT_BINS);
+        sharedAccel  = localAccel;
+        sensorReady  = true;
+        xSemaphoreGive(mutex);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));   // cedeaza CPU
+  }
+}
+
+// =====================================================
+// TASK ESANTIONARE ACCELEROMETRU (rata fixa) + FFT
+// =====================================================
+// Alege axa cea mai relevanta pentru vibratie in functie de montaj.
+// Gravitatia "sta" pe axa verticala, deci vibratia utila e mai vizibila
+// pe celelalte axe. Alegem o axa orizontala fata de montaj.
+int selectAccelAxis(MountMode mode) {
+  // TOP   -> gravitatia pe Z, alegem X
+  // FRONT -> gravitatia pe Y, alegem X
+  // SIDE  -> gravitatia pe X, alegem Y
+  if (mode == TOP)   return 0;  // X
+  if (mode == FRONT) return 0;  // X
+  return 1;                     // Y (SIDE)
+}
+
+// Esantioneaza accelerometrul la ACC_SAMPLE_HZ si umple buffer-ul.
+// Cand buffer-ul e plin, calculeaza FFT-ul.
+void accelSamplingTask(void* pvParameters) {
+  const TickType_t period = pdMS_TO_TICKS(1000 / ACC_SAMPLE_HZ);  // 4ms la 250 Hz
+  TickType_t lastWake = xTaskGetTickCount();
+  int idx = 0;
+
+  for (;;) {
+    // citire accel pe axa selectata (protejat pe I2C, timeout mic)
+    float val = 0.0f;
+    float ax = lastAccX, ay = lastAccY, az = lastAccZ;  // valori de rezerva daca nu prindem mutex-ul
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+      if (accel.available()) accel.read();
+      ax = accel.getCalculatedX() * G_TO_MS2;           // convertim in m/s^2
+      ay = accel.getCalculatedY() * G_TO_MS2;
+      az = accel.getCalculatedZ() * G_TO_MS2;
+      xSemaphoreGive(i2cMutex);
+    }
+    // publicam ultima citire completa pentru dspTask (logging/health)
+    lastAccX = ax; lastAccY = ay; lastAccZ = az;
+    // selectam axa de vibratie pentru FFT
+    if      (accelAxis == 0) val = ax;
+    else if (accelAxis == 1) val = ay;
+    else                     val = az;
+
+    accSampleBuf[idx] = (double)val;
+    idx++;
+
+    if (idx >= ACC_SAMPLES) {
+      idx = 0;
+      computeAccelFFT();   // fereastra plina -> calculam spectrul de vibratie
+    }
+
+    // Mentine rata fixa, dar daca am ramas in urma (FFT/I2C a durat mult),
+    // resincronizeaza si cedeaza CPU explicit ca sa nu infometam watchdog-ul.
+    TickType_t now = xTaskGetTickCount();
+    if ((now - lastWake) >= period) {
+      // am ramas in urma: resetam referinta si cedam macar 1 tick
+      lastWake = now;
+      vTaskDelay(1);
+    } else {
+      vTaskDelayUntil(&lastWake, period);   // dormim exact pana la urmatorul esantion
+    }
+  }
+}
+
+// Calculeaza FFT pe bufferul de accelerometru si publica spectrul de vibratie
+void computeAccelFFT() {
+  // copiem din bufferul partajat si scoatem media (DC = gravitatie + offset)
+  double mean = 0.0;
+  for (int i = 0; i < ACC_SAMPLES; i++) {
+    accReal[i] = accSampleBuf[i];
+    accImag[i] = 0.0;
+    mean += accReal[i];
+  }
+  mean /= ACC_SAMPLES;
+  for (int i = 0; i < ACC_SAMPLES; i++) accReal[i] -= mean;  // centram pe 0 (eliminam gravitatia)
+
+  accFFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  accFFT.compute(FFT_FORWARD);
+  accFFT.complexToMagnitude();
+
+  // pastram primele ACC_FFT_BINS bin-uri (sub mutex)
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    for (int i = 0; i < ACC_FFT_BINS; i++) sharedAccelFFT[i] = accReal[i];
+    accelSpectrumReady = true;
+    xSemaphoreGive(mutex);
+  }
+}
+
+// Copiaza un snapshot consistent al spectrului si acceleratiei (pentru loop)
+bool getSharedSnapshot(double* fftOut, AccelData* accelOut) {
+  if (!sensorReady) return false;       // inca nu avem date valide
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    memcpy(fftOut, sharedFFT, sizeof(double) * FFT_BINS);
+    *accelOut = sharedAccel;
+    xSemaphoreGive(mutex);
+    return true;
+  }
+  return false;
+}
+
+// Reseteaza toate datele de calibrare si scorurile (inceput de sesiune)
+void clearBuffers() {
+  memset(ambientFFT,  0, sizeof(ambientFFT));
+  memset(machineFFT,  0, sizeof(machineFFT));
+  memset(smoothedFFT, 0, sizeof(smoothedFFT));
+  learnedPower = 0.0f; learnedVib = 0.0f; smoothVib = 0.0f;
+  healthScore  = 100.0f; anomalyScore = 0.0f; isMachineOff = false;
+}
+
+// Calculeaza "puterea curata": suma energiilor spectrale peste prag,
+// dupa scaderea zgomotului ambiant. Reprezinta intensitatea semnalului util.
+float computeCleanPower(const double* spectrum, int startBin, int endBin, float gateThreshold) {
+  float total = 0.0f;
+  for (int i = max(0, startBin); i < min(FFT_BINS, endBin); i++) {
+    double clean = spectrum[i] - (ambientFFT[i] * AMBIENT_MULTIPLIER);
+    if (clean > gateThreshold) total += (float)clean;   // numaram doar ce depaseste pragul de zgomot
+  }
+  return total;
+}
+
+// Afiseaza un mesaj centrat pe doua randuri (titlu alb + subtitlu colorat)
+void drawCenteredMessage(const char* line1, const char* line2, uint16_t color) {
+  sprite.fillSprite(BG_COLOR);
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString(line1, SCREEN_CX, SCREEN_CY-20, 4);
+  sprite.setTextColor(color);
+  sprite.drawString(line2, SCREEN_CX, SCREEN_CY+14, 2);
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// PROGRESS SCREEN - inel de progres pentru calibrare (fara artefacte)
+// =====================================================
+void drawProgressScreen(const char* label, int step, int total) {
+  sprite.fillSprite(BG_COLOR);
+
+  float progress = constrain((float)step / (float)total, 0.0f, 1.0f);
+
+  // Inel de fundal (continuu, un singur arc complet) - fara segmente suprapuse
+  sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 110, 102, 0, 360,
+                       sprite.color565(22,22,22), BG_COLOR);
+
+  // Arc de progres: incepe sus (270 grade) si creste in sens orar.
+  // Folosim un singur drawSmoothArc cand nu trece de 360, si doar
+  // doua bucati cand wrap-uieste -> elimina artefactele de suprapunere.
+  int sweep = (int)(progress * 360.0f);
+  if (sweep > 0) {
+    int startA = 270;                 // sus
+    int endA   = startA + sweep;      // sens orar
+    if (endA <= 360) {
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 110, 102,
+                           startA, endA, TFT_CYAN, sprite.color565(22,22,22));
+    } else {
+      // partea 1: de la 270 la 360
+      sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 110, 102,
+                           startA, 360, TFT_CYAN, sprite.color565(22,22,22));
+      // partea 2: de la 0 la restul
+      int rest = endA - 360;
+      if (rest > 0)
+        sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 110, 102,
+                             0, rest, TFT_CYAN, sprite.color565(22,22,22));
+    }
+  }
+
+  // Text central: eticheta + procent
+  sprite.setTextColor(TFT_CYAN);
+  sprite.drawString(label, SCREEN_CX, SCREEN_CY-22, 2);
+  char pBuf[8]; sprintf(pBuf, "%d%%", (int)(progress*100));
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawString(pBuf, SCREEN_CX, SCREEN_CY+14, 4);
+
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// CALIBRARE - aduna esantioane si invata o referinta (ambient sau masina)
+// targetBuffer: unde acumulam spectrul mediu
+// captureOffsetsAndOrientation: la Step 1, invatam si offset-ul gravitatiei + montajul
+// captureLearnedVibration: la Step 2, invatam nivelul de vibratie sanatos
+// =====================================================
+bool runCalibration(double* targetBuffer, bool captureOffsetsAndOrientation, bool captureLearnedVibration) {
+  int captureCount = SAMPLING_COUNTS[currentSamplingIndex];   // cate esantioane (dupa durata aleasa)
+  for (int i = 0; i < FFT_BINS; i++) targetBuffer[i] = 0.0;
+  float tX = 0, tY = 0, tZ = 0, vS = 0;                       // acumulatori
+  int   valid = 0;
+  double    tmpF[FFT_BINS];
+  AccelData e;
+
+  for (int s = 0; s < captureCount; s++) {
+    if (getSharedSnapshot(tmpF, &e)) {
+      for (int i = 0; i < FFT_BINS; i++) targetBuffer[i] += tmpF[i];  // insumam spectrul
+      tX += e.acceleration.x; tY += e.acceleration.y; tZ += e.acceleration.z;
+      if (captureLearnedVibration) {
+        // magnitudinea vibratiei fata de offset-ul de gravitatie
+        float vx = e.acceleration.x - offX, vy = e.acceleration.y - offY, vz = e.acceleration.z - offZ;
+        vS += sqrtf(vx*vx + vy*vy + vz*vz);
+      }
+      valid++;
+    }
+    drawProgressScreen("SAMPLING DATA...", s+1, captureCount);  // bara de progres
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  if (valid == 0) return false;                          // niciun esantion valid -> esec
+  for (int i = 0; i < FFT_BINS; i++) targetBuffer[i] /= valid;  // medie spectrala
+  if (captureOffsetsAndOrientation) {
+    offX = tX / valid; offY = tY / valid; offZ = tZ / valid;     // offset-ul mediu (gravitatia)
+    currentMode = detectMountModeFromGravity(offX, offY, offZ);  // deducem montajul
+    accelAxis = selectAccelAxis(currentMode);   // alege axa pt FFT-ul de vibratie
+    drawCenteredMessage("MOUNT DETECTED", mountModeToString(currentMode), TFT_CYAN);
+    vTaskDelay(pdMS_TO_TICKS(900));
+  }
+  if (captureLearnedVibration && valid > 0) {
+    learnedVib = vS / valid;                             // nivelul de vibratie de referinta
+    // invatam si spectrul de vibratie sanatos (snapshot din spectrul curent)
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      for (int i = 0; i < ACC_FFT_BINS; i++) learnedAccelFFT[i] = sharedAccelFFT[i];
+      xSemaphoreGive(mutex);
+    }
+  }
+  return true;
+}
+
+// =====================================================
+// MONITORING - calculeaza HealthScore-ul din datele curente
+// Compara spectrul si vibratia curenta cu referintele invatate la calibrare.
+// =====================================================
+void updateMonitoring(const double* currentRaw, const AccelData& e) {
+  // acceleratia relativa fata de offset (cat se misca peste gravitatie)
+  float relX = e.acceleration.x - offX;
+  float relY = e.acceleration.y - offY;
+  float relZ = e.acceleration.z - offZ;
+  float dX = 0.0f, dY = 0.0f;
+  // alegem cele doua axe utile pentru afisarea punctului, in functie de montaj
+  if      (currentMode == TOP)   { dX = relX; dY = relY; }
+  else if (currentMode == FRONT) { dX = relX; dY = relZ; }
+  else                           { dX = relY; dY = relZ; }
+
+  // netezim spectrul curent (filtru exponential) ca sa nu sara afisajul
+  for (int i = 0; i < FFT_BINS; i++)
+    smoothedFFT[i] = smoothedFFT[i] * (1.0f - FFT_SMOOTH_ALPHA) + currentRaw[i] * FFT_SMOOTH_ALPHA;
+
+  float cPwr = computeCleanPower(smoothedFFT, 2, FFT_BINS, FFT_NOISE_GATE);   // puterea acustica curenta
+  float rVib = sqrtf(relX*relX + relY*relY + relZ*relZ);                      // magnitudinea vibratiei
+  smoothVib  = smoothVib * (1.0f - VIB_SMOOTH_ALPHA) + rVib * VIB_SMOOTH_ALPHA; // vibratie netezita
+
+  float vRatio  = (learnedVib > 0.01f) ? (smoothVib / learnedVib) : 1.0f;     // raport fata de referinta
+  vibAlertLevel = max(0.0f, vRatio - 1.0f);                                   // cat depaseste normalul
+  // masina e considerata oprita daca puterea si vibratia sunt foarte mici
+  isMachineOff  = (cPwr < (learnedPower * MACHINE_OFF_POWER_RATIO)) && (smoothVib < MACHINE_OFF_VIB_THRESHOLD);
+
+  if (!isMachineOff) {
+    // diferenta spectrala fata de semnatura sanatoasa invatata
+    float diff = 0.0f;
+    for (int i = 2; i < FFT_BINS; i++)
+      diff += fabs(max(0.0, smoothedFFT[i] - ambientFFT[i] * AMBIENT_MULTIPLIER) - machineFFT[i]);
+    diff += vibAlertLevel * VIBRATION_WEIGHT;            // adaugam contributia vibratiei
+    float iHealth = constrain(100.0f - diff / HEALTH_DIFF_SCALE, 0.0f, 100.0f); // health instantaneu
+    // acumulam anomalia in timp: creste daca e mereu prost, scade daca revine
+    anomalyScore  = constrain(anomalyScore + (iHealth < 75.0f ? ANOMALY_ATTACK : -ANOMALY_RELEASE), 0.0f, ANOMALY_MAX);
+    // penalizare doar daca anomalia persista peste prag (ignora varfuri izolate)
+    float penalty = (anomalyScore > ANOMALY_THRESHOLD) ? min(40.0f, (anomalyScore - ANOMALY_THRESHOLD) * 0.9f) : 0.0f;
+    float tHealth = constrain(iHealth - penalty, 0.0f, 100.0f);
+    // netezim health-ul final (raspuns lent, stabil)
+    healthScore   = healthScore * (1.0f - HEALTH_SMOOTH_ALPHA) + tHealth * HEALTH_SMOOTH_ALPHA;
+  } else {
+    // masina oprita: relaxam anomalia si readucem health-ul spre 100
+    anomalyScore  *= 0.96f;
+    vibAlertLevel *= 0.95f;
+    healthScore    = healthScore * 0.96f + 100.0f * 0.04f;
+  }
+
+  // in regim de alerta logam mai des
+  sendInterval = (!isMachineOff && healthScore < HEALTH_ALERT_THRESHOLD)
+    ? SERIAL_INTERVAL_ALERT_MS : SERIAL_INTERVAL_NORMAL_MS;
+
+  if (millis() - lastSerialSend >= (unsigned long)sendInterval) {
+    // Logam si FFT brut + accel + timestamp RTC. Folosim spectrul curat (smoothedFFT)
+    // ca "FFT brut" reprezentativ pentru randul curent.
+    // snapshot spectru vibratie pentru logging
+    double accSpecSnap[ACC_FFT_BINS];
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      for (int i = 0; i < ACC_FFT_BINS; i++) accSpecSnap[i] = sharedAccelFFT[i];
+      xSemaphoreGive(mutex);
+    } else {
+      for (int i = 0; i < ACC_FFT_BINS; i++) accSpecSnap[i] = 0.0;
+    }
+    logDataToSD((int)healthScore, cPwr, smoothVib, vibAlertLevel, anomalyScore, e, smoothedFFT, accSpecSnap);
+    lastSerialSend = millis();
+  }
+
+  // culoarea de afisare in functie de stare/health
+  uint16_t c = isMachineOff ? TFT_BLUE
+    : (healthScore > 75.0f ? TFT_GREEN : (healthScore > 45.0f ? TFT_YELLOW : TFT_RED));
+
+  drawMonitoringUI(dX, dY, mountModeToString(currentMode), c, vibAlertLevel);
+}
+
+// =====================================================
+// MONITORING UI - ecranul live: inel health, spectre, punct vibratie, bara
+// =====================================================
+void drawMonitoringUI(float dispX, float dispY, const char* mountName, uint16_t color, float vibLevel) {
+  sprite.fillSprite(BG_COLOR);
+  // inel de fundal + arc de health proportional cu scorul
+  sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 112, 104, 0, 360, sprite.color565(28,28,28), BG_COLOR);
+  int arcDeg = map((int)healthScore, 0, 100, 0, 360);
+  if (arcDeg > 0)
+    sprite.drawSmoothArc(SCREEN_CX, SCREEN_CY, 112, 104, 270, (270 + arcDeg) % 360, color, BG_COLOR);
+
+  // spectru MICROFON, desenat ca bare radiale (inel exterior)
+  const float FFT_ARC_START = 150.0f, FFT_ARC_SPAN = 240.0f;
+  for (int i = 2; i < 40; i++) {
+    float t   = (float)(i-2) / 38.0f;
+    float rad = (FFT_ARC_START + t * FFT_ARC_SPAN) * DEG_TO_RAD;
+    float mag = (float)max(0.0, smoothedFFT[i] - ambientFFT[i] * AMBIENT_MULTIPLIER); // peste ambient
+    int   amp = constrain((int)(mag / 500.0f), 0, 22);
+    if (amp > 0) {
+      sprite.drawWideLine(
+        SCREEN_CX + (int)(72.0f * cosf(rad)), SCREEN_CY + (int)(72.0f * sinf(rad)),
+        SCREEN_CX + (int)((72.0f+amp) * cosf(rad)), SCREEN_CY + (int)((72.0f+amp) * sinf(rad)),
+        2, color);
+    }
+  }
+
+  // --- Spectru de VIBRATIE (accelerometru), inel interior, culoare distincta ---
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    for (int i = 0; i < ACC_FFT_BINS; i++) accelSpectrum[i] = sharedAccelFFT[i];
+    xSemaphoreGive(mutex);
+  }
+  uint16_t vibColor = sprite.color565(150, 100, 255);   // mov - vibratie
+  for (int i = 2; i < 40; i++) {
+    float t   = (float)(i-2) / 38.0f;
+    float rad = (FFT_ARC_START + t * FFT_ARC_SPAN) * DEG_TO_RAD;
+    float mag = (float)accelSpectrum[i];
+    int   amp = constrain((int)(mag / 2.0f), 0, 18);    // scalare proprie pt vibratie
+    if (amp > 0) {
+      sprite.drawWideLine(
+        SCREEN_CX + (int)(50.0f * cosf(rad)), SCREEN_CY + (int)(50.0f * sinf(rad)),
+        SCREEN_CX + (int)((50.0f - amp) * cosf(rad)), SCREEN_CY + (int)((50.0f - amp) * sinf(rad)),
+        1, vibColor);
+    }
+  }
+
+  // punctul care arata directia/amplitudinea vibratiei curente
+  int dotX = SCREEN_CX + (int)(dispX * 10.0f);
+  int dotY = SCREEN_CY - (int)(dispY * 10.0f);
+  float ddx = dotX - SCREEN_CX, ddy = dotY - SCREEN_CY, dd = sqrtf(ddx*ddx + ddy*ddy);
+  if (dd > 32.0f) { dotX = SCREEN_CX + (int)(ddx/dd*32); dotY = SCREEN_CY + (int)(ddy/dd*32); } // limitam raza
+
+  if (!isMachineOff) {
+    sprite.drawLine(SCREEN_CX, SCREEN_CY, dotX, dotY, sprite.color565(60,60,60));
+    sprite.fillCircle(dotX, dotY, 5, color);
+    sprite.fillCircle(SCREEN_CX, SCREEN_CY, 3, sprite.color565(80,80,80));
+  } else {
+    sprite.drawSmoothCircle(SCREEN_CX, SCREEN_CY, 12, TFT_BLUE, BG_COLOR);  // standby
+  }
+
+  // valoarea health-ului, mare, in centru
+  sprite.setTextColor(TFT_WHITE);
+  sprite.drawNumber((int)healthScore, SCREEN_CX, SCREEN_CY-8, 6);
+  sprite.setTextColor(TFT_DARKGREY);
+  sprite.drawString(mountName, SCREEN_CX, 42, 2);   // orientarea de montaj
+
+  if (rtcAvailable) {
+    char timeBuf[9]; sprintf(timeBuf, "%02d:%02d", rtcCache.hour, rtcCache.min);
+    sprite.setTextColor(sprite.color565(45,45,45));
+    sprite.drawString(timeBuf, SCREEN_CX, 57, 1);
+  }
+
+  // eticheta de stare textuala
+  sprite.setTextColor(isMachineOff ? TFT_BLUE : color);
+  sprite.drawString(isMachineOff ? "STANDBY" : (healthScore < 50.0f ? "CHECK!" : "OK"), SCREEN_CX, SCREEN_CY+36, 2);
+
+  // bara verticala de vibratie (in dreapta)
+  const int VIB_CX = SCREEN_CX + 82, VIB_CY = SCREEN_CY + 20, barH = 55;
+  int fillH = (int)(constrain(vibLevel / 1.5f, 0.0f, 1.0f) * barH);
+  sprite.drawRoundRect(VIB_CX-6, VIB_CY-barH, 12, barH, 3, sprite.color565(40,40,40));
+  if (fillH > 0) sprite.fillRoundRect(VIB_CX-4, VIB_CY-fillH, 8, fillH, 2, color);
+  sprite.setTextColor(sprite.color565(60,60,60));
+  sprite.drawString("V", VIB_CX, VIB_CY+6, 1);
+
+  drawCircularClipBorder(sprite.color565(25,25,25));
+  sprite.pushSprite(0, 0);
+}
+
+// =====================================================
+// SD LOGGING - scrierea datelor in fisierul CSV
+// =====================================================
+// Pregateste un nume de fisier liber de tip /log_N.csv (cazul fara utilaj selectat)
+void prepareNextLogFile() {
+  int fileNum = 1;
+  while (true) {
+    sprintf(currentLogFile, "/log_%d.csv", fileNum);
+    if (!SD.exists(currentLogFile)) break;   // primul nume liber
+    fileNum++;
+  }
+  logIndex = 1;
+}
+
+// Scrie un rand complet in CSV: metadate + spectru microfon + spectru vibratie
+void logDataToSD(int hScore, float pwr, float sVib, float vAlert, float aScore,
+                 const AccelData& e, const double* rawFFT, const double* accFFTspec) {
+  File dataFile = SD.open(currentLogFile, SD.exists(currentLogFile) ? FILE_APPEND : FILE_WRITE);
+  if (!dataFile) return;
+
+  // Header la primul rand (cand fisierul e gol)
+  if (dataFile.size() == 0) {
+    dataFile.print("Index,Data,Ora,Timp(ms),HealthScore,Power,SmoothVib,VibAlert,Anomaly,AccX,AccY,AccZ,AccelAxis");
+    for (int i = 0; i < FFT_BINS; i++) dataFile.printf(",MIC%d", i);       // spectru microfon
+    for (int i = 0; i < ACC_FFT_BINS; i++) dataFile.printf(",VIB%d", i);   // spectru vibratie
+    dataFile.println();
+  }
+
+  char dBuf[12], tBuf[12];
+  rtcDateString(dBuf, sizeof(dBuf));   // data curenta
+  rtcTimeString(tBuf, sizeof(tBuf));   // ora curenta
+
+  const char* axisName = (accelAxis == 0) ? "X" : (accelAxis == 1) ? "Y" : "Z";  // axa de vibratie
+
+  // Coloane fixe (HealthScore ramane al 5-lea camp -> compatibil cu graficul de pe ecran)
+  dataFile.printf("%lu,%s,%s,%lu,%d,%.1f,%.3f,%.3f,%.1f,%.3f,%.3f,%.3f,%s",
+    logIndex++, dBuf, tBuf, millis(),
+    hScore, pwr, sVib, vAlert, aScore,
+    e.acceleration.x, e.acceleration.y, e.acceleration.z, axisName);
+
+  // spectru microfon (MIC0..MICn)
+  for (int i = 0; i < FFT_BINS; i++) dataFile.printf(",%.1f", rawFFT[i]);
+  // spectru vibratie accelerometru (VIB0..VIBn)
+  for (int i = 0; i < ACC_FFT_BINS; i++) dataFile.printf(",%.2f", accFFTspec[i]);
+  dataFile.println();
+
+  dataFile.close();
+}
+
+// =====================================================
+// INIT HARDWARE - initializarea fiecarui periferic
+// =====================================================
+// Accelerometrul MMA8452Q pe I2C (scala +-8g, rata 800 Hz)
+bool initAccelerometer() {
+  Wire.begin(I2C_SDA, I2C_SCL);                // SDA=8, SCL=9 pentru AMBELE dispozitive I2C
+  if (!accel.begin(Wire, 0x1C)) return false;  // MMA8452Q la 0x1C (SA0=LOW)
+  accel.setScale(SCALE_8G);
+  accel.setDataRate(ODR_800);
+  return true;
+}
+
+// Ecranul TFT + sprite-ul buffer in memorie
+bool initDisplay() {
+  tft.init();
+  tft.setRotation(0);
+  tft.fillScreen(BG_COLOR);
+  sprite.setColorDepth(8);                     // 8 biti/pixel (economie de RAM)
+  if (!sprite.createSprite(240, 240)) return false;
+  sprite.setTextDatum(MC_DATUM);               // text centrat implicit
+  return true;
+}
+
+// Cardul SD pe magistrala SPI dedicata
+bool initSDCard() {
+  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS_PIN);
+  return SD.begin(SD_CS_PIN, spiSD, 4000000);  // 4 MHz
+}
+
+// Cele doua mutex-uri (date partajate + acces I2C)
+bool initMutex() {
+  mutex = xSemaphoreCreateMutex();
+  i2cMutex = xSemaphoreCreateMutex();
+  return (mutex != nullptr && i2cMutex != nullptr);
+}
+
+// Interfata I2S pentru microfonul digital
+bool initI2S() {
+  i2s_config_t i2s_c = {};
+  i2s_c.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);  // master, doar receptie
+  i2s_c.sample_rate          = SAMPLING_FREQ;
+  i2s_c.bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT;
+  i2s_c.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;   // un singur canal
+  i2s_c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  i2s_c.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+  i2s_c.dma_buf_count        = 4;
+  i2s_c.dma_buf_len          = SAMPLES;
+  i2s_c.use_apll             = false;
+  i2s_pin_config_t pins = {
+    .bck_io_num   = I2S_SCK,
+    .ws_io_num    = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,   // nu transmitem nimic
+    .data_in_num  = I2S_SD
+  };
+  if (i2s_driver_install(I2S_NUM_0, &i2s_c, 0, NULL) != ESP_OK) return false;
+  if (i2s_set_pin(I2S_NUM_0, &pins)                  != ESP_OK) return false;
+  return true;
+}
+
+// Deduce orientarea de montaj din axa pe care "cade" gravitatia
+MountMode detectMountModeFromGravity(float ax, float ay, float az) {
+  float aX = fabs(ax), aY = fabs(ay), aZ = fabs(az);
+  if (aZ >= aX && aZ >= aY) return TOP;     // gravitatia pe Z -> montaj orizontal
+  if (aY >= aX && aY >= aZ) return FRONT;   // gravitatia pe Y -> montaj frontal
+  return SIDE;                              // gravitatia pe X -> montaj lateral
+}
+
+// Converteste orientarea in text pentru afisare
+const char* mountModeToString(MountMode mode) {
+  return mode == TOP ? "TOP" : (mode == FRONT ? "FRONT" : "SIDE");
+}
